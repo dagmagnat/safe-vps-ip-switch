@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP="safe-vps-ip-switch"
 DISPLAY_NAME="ZAMENAIP"
-VERSION="2.1.0"
+VERSION="2.1.1"
 CONFIG_FILE="/etc/${APP}.conf"
 STATE_DIR="/var/lib/${APP}"
 BACKUP_ROOT="/var/backups/${APP}"
@@ -1107,33 +1107,40 @@ HELP_EN
   pause_menu
 }
 
-# ---------- Program update / repair ----------
+# ---------- Program install / update / repair ----------
 
-fetch_update_tree() {
-  local dest="$1" branch="$UPDATE_BRANCH" archive
-  archive="${dest}/repo.tar.gz"
-  mkdir -p "${dest}/src"
+latest_raw_url() {
+  local branch="${1:-$UPDATE_BRANCH}"
+  printf 'https://raw.githubusercontent.com/%s/%s/%s.sh\n' "$GITHUB_REPO" "$branch" "$APP"
+}
 
-  if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 \
-      "https://github.com/${GITHUB_REPO}/archive/refs/heads/${branch}.tar.gz" \
-      -o "$archive"; then
-    if [[ "$branch" == "main" ]]; then
-      branch="master"
-      warn "$(T 'Ветка main недоступна, пробуем master.' 'main branch unavailable; trying master.')"
-      curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 \
-        "https://github.com/${GITHUB_REPO}/archive/refs/heads/${branch}.tar.gz" \
-        -o "$archive" || return 1
-    else
-      return 1
-    fi
+download_latest_script() {
+  local dest="$1" branch="$UPDATE_BRANCH" url
+  url="$(latest_raw_url "$branch")"
+  if curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 "$url" -o "$dest"; then
+    return 0
   fi
-
-  tar -xzf "$archive" -C "${dest}/src" --strip-components=1
-  [[ -f "${dest}/src/${APP}.sh" && -f "${dest}/src/install.sh" ]]
+  if [[ "$branch" == "main" ]]; then
+    branch="master"
+    warn "$(T 'Ветка main недоступна, пробуем master.' 'main branch unavailable; trying master.')"
+    url="$(latest_raw_url "$branch")"
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 "$url" -o "$dest"
+    return $?
+  fi
+  return 1
 }
 
 script_version_from_file() {
   awk -F'"' '/^VERSION="/{print $2; exit}' "$1" 2>/dev/null || true
+}
+
+install_file_atomically() {
+  local source="$1" target="$2" dir tmp
+  dir="$(dirname "$target")"
+  install -d -m 755 "$dir"
+  tmp="$(mktemp "${dir}/.zamenaip-install.XXXXXX")"
+  install -m 755 "$source" "$tmp"
+  mv -f "$tmp" "$target"
 }
 
 repair_launcher_from_current() {
@@ -1141,19 +1148,60 @@ repair_launcher_from_current() {
   self="$(readlink -f "${BASH_SOURCE[0]}")"
   install -d -m 755 "$INSTALL_DIR"
 
-  # If this is a repository copy, install it atomically. If this is already the
-  # installed copy, only repair the launcher.
-  if [[ "$self" != "$INSTALL_TARGET" ]]; then
+  if [[ -f "$self" && "$self" != "$INSTALL_TARGET" ]]; then
     bash -n "$self" || return 1
-    local tmp
-    tmp="$(mktemp "${INSTALL_DIR}/.zamenaip-repair.XXXXXX")"
-    install -m 755 "$self" "$tmp"
-    mv -f "$tmp" "$INSTALL_TARGET"
+    install_file_atomically "$self" "$INSTALL_TARGET" || return 1
+  fi
+
+  if [[ ! -f "$INSTALL_TARGET" ]]; then
+    err "$(T 'Установленный файл программы не найден.' 'Installed program file was not found.')"
+    return 1
   fi
 
   rm -f "$BIN_LINK"
   ln -s "$INSTALL_TARGET" "$BIN_LINK"
   [[ "$(readlink -f "$BIN_LINK")" == "$INSTALL_TARGET" ]]
+}
+
+install_self_cli() {
+  local self backup_dir
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+
+  if [[ ! -f "$self" ]]; then
+    cat >&2 <<'EOF_INSTALL_ERR'
+Cannot install directly from stdin.
+Нельзя установить программу прямо из stdin.
+
+Use / Используйте:
+  curl -fsSL https://raw.githubusercontent.com/dagmagnat/safe-vps-ip-switch/main/safe-vps-ip-switch.sh -o /tmp/zamenaip-latest.sh
+  sudo bash /tmp/zamenaip-latest.sh install
+EOF_INSTALL_ERR
+    return 1
+  fi
+
+  bash -n "$self" || return 1
+  mkdir -p "$BACKUP_ROOT"
+  chmod 700 "$BACKUP_ROOT" 2>/dev/null || true
+
+  if [[ -f "$INSTALL_TARGET" ]]; then
+    backup_dir="${BACKUP_ROOT}/program-install-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup_dir"
+    cp -a "$INSTALL_TARGET" "${backup_dir}/${APP}.sh" 2>/dev/null || true
+    [[ -e "$BIN_LINK" || -L "$BIN_LINK" ]] && cp -a "$BIN_LINK" "${backup_dir}/zamenaip-launcher" 2>/dev/null || true
+    printf '%s\n' "$VERSION" > "${backup_dir}/source-version.txt"
+    printf 'Backup / Резервная копия: %s\n' "$backup_dir"
+  fi
+
+  install_file_atomically "$self" "$INSTALL_TARGET"
+  rm -f "$BIN_LINK"
+  ln -s "$INSTALL_TARGET" "$BIN_LINK"
+  hash -r 2>/dev/null || true
+
+  printf '\nInstalled / Установлено:\n  %s\n' "$INSTALL_TARGET"
+  printf 'Quick command / Быстрая команда:\n  %s\n' "$BIN_LINK"
+  printf 'Version / Версия: %s\n\n' "$($BIN_LINK --version 2>/dev/null || printf unknown)"
+  printf 'Run / Запуск:\n  sudo zamenaip\n\n'
+  printf 'Update / Обновление:\n  sudo zamenaip update\n'
 }
 
 repair_screen() {
@@ -1170,7 +1218,7 @@ repair_screen() {
 
 update_app() {
   local context="${1:-cli}"; shift || true
-  local assume_yes=0 force=0 arg tmp src latest backup_dir new_version
+  local assume_yes=0 force=0 arg tmp latest backup_dir new_version
   for arg in "$@"; do
     case "$arg" in
       -y|--yes) assume_yes=1 ;;
@@ -1183,39 +1231,38 @@ update_app() {
   printf '%-24s %s\n' "$(T 'Текущая версия:' 'Current version:')" "$VERSION"
   printf '%-24s %s\n' "$(T 'Репозиторий:' 'Repository:')" "https://github.com/${GITHUB_REPO}"
   printf '%-24s %s\n\n' "$(T 'Ветка:' 'Branch:')" "$UPDATE_BRANCH"
-  info "$(T 'Проверяем обновления на GitHub...' 'Checking GitHub for updates...')"
+  info "$(T 'Скачиваем основной скрипт с GitHub...' 'Downloading the main script from GitHub...')"
 
-  tmp="$(mktemp -d /tmp/zamenaip-update.XXXXXX)"
-  if ! fetch_update_tree "$tmp"; then
-    rm -rf "$tmp"
-    err "$(T 'Не удалось скачать или распаковать проект.' 'Could not download or extract the project.')"
-    return 1
-  fi
-  src="${tmp}/src"
-
-  if ! bash -n "${src}/${APP}.sh" || ! bash -n "${src}/install.sh"; then
-    rm -rf "$tmp"
-    err "$(T 'Новая версия не прошла проверку синтаксиса. Установка отменена.' 'The downloaded version failed syntax validation. Update cancelled.')"
+  tmp="$(mktemp /tmp/zamenaip-update.XXXXXX.sh)"
+  if ! download_latest_script "$tmp"; then
+    rm -f "$tmp"
+    err "$(T 'Не удалось скачать новую версию с GitHub.' 'Could not download the new version from GitHub.')"
     return 1
   fi
 
-  latest="$(script_version_from_file "${src}/${APP}.sh")"
+  if ! bash -n "$tmp"; then
+    rm -f "$tmp"
+    err "$(T 'Новая версия не прошла bash -n. Обновление отменено.' 'The downloaded version failed bash -n. Update cancelled.')"
+    return 1
+  fi
+
+  latest="$(script_version_from_file "$tmp")"
   if [[ -z "$latest" ]]; then
-    rm -rf "$tmp"
-    err "$(T 'Не удалось определить версию скачанного проекта.' 'Could not determine downloaded project version.')"
+    rm -f "$tmp"
+    err "$(T 'Не удалось определить версию скачанного скрипта.' 'Could not determine downloaded script version.')"
     return 1
   fi
 
   printf '%-24s %s\n\n' "$(T 'Версия на GitHub:' 'GitHub version:')" "$latest"
   if [[ "$latest" == "$VERSION" && $force -eq 0 ]]; then
-    ok "$(T 'У вас уже установлена эта версия. Для переустановки используйте: zamenaip update --force' 'This version is already installed. To reinstall it use: zamenaip update --force')"
-    rm -rf "$tmp"
+    ok "$(T 'Уже установлена актуальная версия. Для переустановки: zamenaip update --force' 'The current version is already installed. To reinstall: zamenaip update --force')"
+    rm -f "$tmp"
     return 0
   fi
 
   if (( assume_yes == 0 )) && [[ -t 0 ]]; then
-    if ! confirm_choice "$(T "Обновить ZAMENAIP ${VERSION} -> ${latest}? Сетевые настройки и backup не удаляются." "Update ZAMENAIP ${VERSION} -> ${latest}? Network settings and backups are preserved.")"; then
-      rm -rf "$tmp"
+    if ! confirm_choice "$(T "Обновить ZAMENAIP ${VERSION} -> ${latest}? Сеть, Netplan и сетевые backup не изменяются." "Update ZAMENAIP ${VERSION} -> ${latest}? Network, Netplan, and network backups are preserved.")"; then
+      rm -f "$tmp"
       info "$(T 'Обновление отменено.' 'Update cancelled.')"
       return 0
     fi
@@ -1233,20 +1280,28 @@ update_app() {
   printf '%s\n' "$VERSION" > "${backup_dir}/version.txt"
   ok "$(T 'Резервная копия программы:' 'Program backup:') $backup_dir"
 
-  if ! bash "${src}/install.sh" --no-start; then
-    err "$(T 'Установщик новой версии завершился ошибкой. Пробуем вернуть предыдущий исполняемый файл.' 'The new installer failed. Attempting to restore the previous executable.')"
+  if ! install_file_atomically "$tmp" "$INSTALL_TARGET"; then
+    rm -f "$tmp"
+    err "$(T 'Не удалось установить скачанный файл.' 'Could not install the downloaded file.')"
+    return 1
+  fi
+  rm -f "$BIN_LINK"
+  ln -s "$INSTALL_TARGET" "$BIN_LINK"
+  hash -r 2>/dev/null || true
+
+  if ! bash -n "$INSTALL_TARGET"; then
+    err "$(T 'Проверка установленной версии не прошла. Возвращаем предыдущую.' 'Installed version validation failed. Restoring previous version.')"
     if [[ -f "${backup_dir}/${APP}.sh" ]]; then
-      install -d -m 755 "$INSTALL_DIR"
-      install -m 755 "${backup_dir}/${APP}.sh" "$INSTALL_TARGET"
+      install_file_atomically "${backup_dir}/${APP}.sh" "$INSTALL_TARGET"
       rm -f "$BIN_LINK"
       ln -s "$INSTALL_TARGET" "$BIN_LINK"
     fi
-    rm -rf "$tmp"
+    rm -f "$tmp"
     return 1
   fi
 
   new_version="$($BIN_LINK --version 2>/dev/null || true)"
-  rm -rf "$tmp"
+  rm -f "$tmp"
   ok "$(T 'Обновление установлено.' 'Update installed.')"
   printf '%s: %s\n' "$(T 'Установлено' 'Installed')" "${new_version:-unknown}"
   printf '%s\n' "$(T 'Сеть, Netplan, настройки языка и резервные копии не изменялись.' 'Network, Netplan, language settings, and backups were not changed.')"
@@ -1318,6 +1373,8 @@ Usage:
   sudo zamenaip update          Update from GitHub
   sudo zamenaip update --force  Reinstall current GitHub version
   sudo zamenaip repair          Repair /usr/local/bin/zamenaip
+  sudo ./safe-vps-ip-switch.sh install
+                              Install/repair quick command from this file
   zamenaip --version
 EOF_USAGE
 }
@@ -1335,6 +1392,11 @@ main() {
   case "$cmd" in
     --version|version) printf '%s %s\n' "$APP" "$VERSION"; return 0 ;;
     -h|--help|help) usage; return 0 ;;
+    install)
+      ensure_root_for_menu
+      install_self_cli "$@"
+      return $?
+      ;;
   esac
 
   load_config

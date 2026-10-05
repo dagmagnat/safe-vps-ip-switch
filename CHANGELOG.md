@@ -1,3 +1,12 @@
+
+## 2.1.1
+
+- `zamenaip update` no longer depends on `install.sh` being present on the server or in the downloaded update tree.
+- Added direct self-install mode: `sudo bash safe-vps-ip-switch.sh install`.
+- Added one-time emergency repair flow for old installations that do not know the `update` command.
+- Program replacement is atomic and backs up the previously installed executable.
+- `install.sh` can recover even when downloaded without the rest of the repository.
+
 # Changelog
 
 ## 2.1.0 - 2026-10-05

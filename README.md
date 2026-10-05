@@ -210,3 +210,23 @@ ZAMENAIP **never releases or deletes an IP from the hosting-provider panel**. Pe
 ## License
 
 MIT.
+
+## Update and emergency repair
+
+Normal update after installation:
+
+```bash
+sudo zamenaip update
+```
+
+If a very old installed version returns `Unknown command: update`, do a one-time repair:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dagmagnat/safe-vps-ip-switch/main/safe-vps-ip-switch.sh -o /tmp/zamenaip-latest.sh
+sudo bash -n /tmp/zamenaip-latest.sh
+sudo bash /tmp/zamenaip-latest.sh install
+zamenaip --version
+```
+
+Starting with v2.1.1, updates do not depend on a local `install.sh`: `zamenaip update` downloads the main `safe-vps-ip-switch.sh` directly, validates it with `bash -n`, creates a program backup, and atomically replaces the installed copy. Netplan and network backups are preserved.
+

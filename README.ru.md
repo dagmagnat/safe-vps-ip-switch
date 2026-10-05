@@ -260,3 +260,23 @@ sudo ./uninstall.sh
 ## Лицензия
 
 MIT.
+
+## Обновление и аварийное восстановление
+
+Обычное обновление после установки:
+
+```bash
+sudo zamenaip update
+```
+
+Если на сервере осталась очень старая версия и она отвечает `Unknown command: update`, выполните одноразовое восстановление:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dagmagnat/safe-vps-ip-switch/main/safe-vps-ip-switch.sh -o /tmp/zamenaip-latest.sh
+sudo bash -n /tmp/zamenaip-latest.sh
+sudo bash /tmp/zamenaip-latest.sh install
+zamenaip --version
+```
+
+Начиная с v2.1.1 обновление не зависит от наличия `install.sh` в установленной копии: `zamenaip update` скачивает и проверяет основной `safe-vps-ip-switch.sh` напрямую, делает backup программы и заменяет её атомарно. Netplan и сетевые backup при этом не удаляются.
+
