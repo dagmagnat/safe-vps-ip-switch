@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.0 - 2026-10-05
+
+- Added `zamenaip update` to update the installed program directly from GitHub.
+- Added `zamenaip update --force` to reinstall the current GitHub version.
+- Added `zamenaip repair` to repair `/usr/local/bin/zamenaip` from a repository checkout.
+- Added update item to the interactive menu.
+- Added a remote bootstrap mode for `install.sh`, so installation/recovery works through a single `curl | sudo bash` command.
+- Installer now automatically replaces stale hand-made wrappers and broken symlinks with the canonical launcher.
+- Installer now performs an atomic main-script replacement and keeps the previous installed executable.
+- Updater validates downloaded Bash scripts before installing and backs up the current program under `/var/backups/safe-vps-ip-switch/`.
+- Added one-time migration instructions for older installations that do not yet have the update command.
+
 ## 2.0.0 - 2026-10-05
 
 - Reworked the project into a guided operator-friendly TUI-style menu.

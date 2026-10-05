@@ -45,3 +45,19 @@ If verification passes, detach the old provider IP first. Verify SSH and the web
 ## If something goes wrong
 
 Run `sudo zamenaip`, choose `4`, and restore the latest known-good backup. ZAMENAIP creates an additional safety backup before restore.
+
+## Updating ZAMENAIP
+
+Use the **Update ZAMENAIP** main-menu item or run:
+
+```bash
+sudo zamenaip update
+```
+
+For a very old installation that does not yet support `update`, run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dagmagnat/safe-vps-ip-switch/main/install.sh | sudo bash -s -- --no-start
+```
+
+This updates the application and repairs the `zamenaip` launcher without changing the current IP or Netplan configuration.

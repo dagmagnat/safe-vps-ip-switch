@@ -28,6 +28,7 @@ Current public IPv4: 5.42.120.63    Interface: eth0
   5) Check website and DNS
   6) Settings / language
   7) Operator guide
+  8) Update ZAMENAIP
   0) Exit
 ```
 
@@ -54,6 +55,8 @@ Current public IPv4: 5.42.120.63    Interface: eth0
 - interactive backup listing and restore;
 - safety backup before restore;
 - explicit confirmation before reboot;
+- built-in GitHub updater via `sudo zamenaip update`;
+- automatic repair of stale/hand-made `/usr/local/bin/zamenaip` launchers during installation;
 - audit log at `/var/log/safe-vps-ip-switch.log`.
 
 ## Provider/API limitation
@@ -66,11 +69,21 @@ The same applies to DNS: automatic DNS changes require a provider-specific API. 
 
 ## Installation
 
+Standard installation from GitHub:
+
 ```bash
 git clone https://github.com/dagmagnat/safe-vps-ip-switch.git
 cd safe-vps-ip-switch
 sudo ./install.sh
 ```
+
+Or install in one command without cloning:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dagmagnat/safe-vps-ip-switch/main/install.sh | sudo bash
+```
+
+The remote installer downloads the complete project, validates Bash syntax, and creates the `zamenaip` command.
 
 The installer checks dependencies, installs missing packages through `apt-get` when available, installs the application under `/usr/local/lib/safe-vps-ip-switch/`, and creates the short command `/usr/local/bin/zamenaip`.
 
@@ -84,6 +97,35 @@ Then run from any directory:
 
 ```bash
 sudo zamenaip
+```
+
+
+## Updating
+
+After installation, you do not need to clone the repository again. Update directly from GitHub with:
+
+```bash
+sudo zamenaip update
+```
+
+The updater downloads the current `dagmagnat/safe-vps-ip-switch` tree, validates its Bash syntax, shows current/new versions, backs up the installed executable, runs the new installer, and repairs `/usr/local/bin/zamenaip`. It does not change Netplan, current network settings, language configuration, switch state, or network backups.
+
+Force reinstall the same GitHub version:
+
+```bash
+sudo zamenaip update --force
+```
+
+For migration from an old release that does not yet support `zamenaip update`, run this once:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dagmagnat/safe-vps-ip-switch/main/install.sh | sudo bash -s -- --no-start
+```
+
+If only the quick launcher is damaged and you are running the new script directly from a repository checkout:
+
+```bash
+sudo ./safe-vps-ip-switch.sh repair
 ```
 
 ## Recommended operator workflow
@@ -131,6 +173,8 @@ sudo zamenaip backup       # create a backup
 sudo zamenaip rollback     # backup/restore menu
 sudo zamenaip language     # change language
 sudo zamenaip status       # network status
+sudo zamenaip update       # update from GitHub
+sudo zamenaip repair       # repair /usr/local/bin/zamenaip
 zamenaip --version
 ```
 

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP="safe-vps-ip-switch"
 DISPLAY_NAME="ZAMENAIP"
-VERSION="2.0.0"
+VERSION="2.1.0"
 CONFIG_FILE="/etc/${APP}.conf"
 STATE_DIR="/var/lib/${APP}"
 BACKUP_ROOT="/var/backups/${APP}"
@@ -12,6 +12,11 @@ MANAGED_NETPLAN="/etc/netplan/99-zamenaip.yaml"
 TRY_TIMEOUT=120
 ROUTE_TABLE=51820
 ROUTE_RULE_PRIORITY=10990
+GITHUB_REPO="dagmagnat/safe-vps-ip-switch"
+UPDATE_BRANCH="${ZAMENAIP_UPDATE_BRANCH:-main}"
+INSTALL_DIR="/usr/local/lib/${APP}"
+INSTALL_TARGET="${INSTALL_DIR}/${APP}.sh"
+BIN_LINK="/usr/local/bin/zamenaip"
 
 LANGUAGE=""
 DEFAULT_DOMAIN=""
@@ -1102,6 +1107,162 @@ HELP_EN
   pause_menu
 }
 
+# ---------- Program update / repair ----------
+
+fetch_update_tree() {
+  local dest="$1" branch="$UPDATE_BRANCH" archive
+  archive="${dest}/repo.tar.gz"
+  mkdir -p "${dest}/src"
+
+  if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 \
+      "https://github.com/${GITHUB_REPO}/archive/refs/heads/${branch}.tar.gz" \
+      -o "$archive"; then
+    if [[ "$branch" == "main" ]]; then
+      branch="master"
+      warn "$(T 'Ветка main недоступна, пробуем master.' 'main branch unavailable; trying master.')"
+      curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 \
+        "https://github.com/${GITHUB_REPO}/archive/refs/heads/${branch}.tar.gz" \
+        -o "$archive" || return 1
+    else
+      return 1
+    fi
+  fi
+
+  tar -xzf "$archive" -C "${dest}/src" --strip-components=1
+  [[ -f "${dest}/src/${APP}.sh" && -f "${dest}/src/install.sh" ]]
+}
+
+script_version_from_file() {
+  awk -F'"' '/^VERSION="/{print $2; exit}' "$1" 2>/dev/null || true
+}
+
+repair_launcher_from_current() {
+  local self
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+  install -d -m 755 "$INSTALL_DIR"
+
+  # If this is a repository copy, install it atomically. If this is already the
+  # installed copy, only repair the launcher.
+  if [[ "$self" != "$INSTALL_TARGET" ]]; then
+    bash -n "$self" || return 1
+    local tmp
+    tmp="$(mktemp "${INSTALL_DIR}/.zamenaip-repair.XXXXXX")"
+    install -m 755 "$self" "$tmp"
+    mv -f "$tmp" "$INSTALL_TARGET"
+  fi
+
+  rm -f "$BIN_LINK"
+  ln -s "$INSTALL_TARGET" "$BIN_LINK"
+  [[ "$(readlink -f "$BIN_LINK")" == "$INSTALL_TARGET" ]]
+}
+
+repair_screen() {
+  header "$(T 'Исправление установки' 'Repair installation')"
+  printf '%s\n\n' "$(T 'Команда будет заново привязана к установленному скрипту. Сеть и Netplan не изменяются.' 'The launcher will be relinked to the installed script. Network and Netplan are not changed.')"
+  if repair_launcher_from_current; then
+    ok "$(T 'Команда zamenaip исправлена.' 'zamenaip launcher repaired.')"
+    printf '  %s -> %s\n' "$BIN_LINK" "$INSTALL_TARGET"
+  else
+    err "$(T 'Не удалось исправить установку.' 'Could not repair the installation.')"
+    return 1
+  fi
+}
+
+update_app() {
+  local context="${1:-cli}"; shift || true
+  local assume_yes=0 force=0 arg tmp src latest backup_dir new_version
+  for arg in "$@"; do
+    case "$arg" in
+      -y|--yes) assume_yes=1 ;;
+      --force) force=1 ;;
+      *) err "$(T "Неизвестный параметр обновления: $arg" "Unknown update option: $arg")"; return 2 ;;
+    esac
+  done
+
+  header "$(T 'Обновление ZAMENAIP' 'Update ZAMENAIP')"
+  printf '%-24s %s\n' "$(T 'Текущая версия:' 'Current version:')" "$VERSION"
+  printf '%-24s %s\n' "$(T 'Репозиторий:' 'Repository:')" "https://github.com/${GITHUB_REPO}"
+  printf '%-24s %s\n\n' "$(T 'Ветка:' 'Branch:')" "$UPDATE_BRANCH"
+  info "$(T 'Проверяем обновления на GitHub...' 'Checking GitHub for updates...')"
+
+  tmp="$(mktemp -d /tmp/zamenaip-update.XXXXXX)"
+  if ! fetch_update_tree "$tmp"; then
+    rm -rf "$tmp"
+    err "$(T 'Не удалось скачать или распаковать проект.' 'Could not download or extract the project.')"
+    return 1
+  fi
+  src="${tmp}/src"
+
+  if ! bash -n "${src}/${APP}.sh" || ! bash -n "${src}/install.sh"; then
+    rm -rf "$tmp"
+    err "$(T 'Новая версия не прошла проверку синтаксиса. Установка отменена.' 'The downloaded version failed syntax validation. Update cancelled.')"
+    return 1
+  fi
+
+  latest="$(script_version_from_file "${src}/${APP}.sh")"
+  if [[ -z "$latest" ]]; then
+    rm -rf "$tmp"
+    err "$(T 'Не удалось определить версию скачанного проекта.' 'Could not determine downloaded project version.')"
+    return 1
+  fi
+
+  printf '%-24s %s\n\n' "$(T 'Версия на GitHub:' 'GitHub version:')" "$latest"
+  if [[ "$latest" == "$VERSION" && $force -eq 0 ]]; then
+    ok "$(T 'У вас уже установлена эта версия. Для переустановки используйте: zamenaip update --force' 'This version is already installed. To reinstall it use: zamenaip update --force')"
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  if (( assume_yes == 0 )) && [[ -t 0 ]]; then
+    if ! confirm_choice "$(T "Обновить ZAMENAIP ${VERSION} -> ${latest}? Сетевые настройки и backup не удаляются." "Update ZAMENAIP ${VERSION} -> ${latest}? Network settings and backups are preserved.")"; then
+      rm -rf "$tmp"
+      info "$(T 'Обновление отменено.' 'Update cancelled.')"
+      return 0
+    fi
+  fi
+
+  ensure_dirs
+  backup_dir="${BACKUP_ROOT}/program-update-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$backup_dir"
+  if [[ -f "$INSTALL_TARGET" ]]; then
+    cp -a "$INSTALL_TARGET" "${backup_dir}/${APP}.sh"
+  fi
+  if [[ -e "$BIN_LINK" || -L "$BIN_LINK" ]]; then
+    cp -a "$BIN_LINK" "${backup_dir}/zamenaip-launcher" 2>/dev/null || true
+  fi
+  printf '%s\n' "$VERSION" > "${backup_dir}/version.txt"
+  ok "$(T 'Резервная копия программы:' 'Program backup:') $backup_dir"
+
+  if ! bash "${src}/install.sh" --no-start; then
+    err "$(T 'Установщик новой версии завершился ошибкой. Пробуем вернуть предыдущий исполняемый файл.' 'The new installer failed. Attempting to restore the previous executable.')"
+    if [[ -f "${backup_dir}/${APP}.sh" ]]; then
+      install -d -m 755 "$INSTALL_DIR"
+      install -m 755 "${backup_dir}/${APP}.sh" "$INSTALL_TARGET"
+      rm -f "$BIN_LINK"
+      ln -s "$INSTALL_TARGET" "$BIN_LINK"
+    fi
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  new_version="$($BIN_LINK --version 2>/dev/null || true)"
+  rm -rf "$tmp"
+  ok "$(T 'Обновление установлено.' 'Update installed.')"
+  printf '%s: %s\n' "$(T 'Установлено' 'Installed')" "${new_version:-unknown}"
+  printf '%s\n' "$(T 'Сеть, Netplan, настройки языка и резервные копии не изменялись.' 'Network, Netplan, language settings, and backups were not changed.')"
+
+  if [[ "$context" == "menu" && -t 0 ]]; then
+    if confirm_choice "$(T 'Перезапустить ZAMENAIP сейчас, чтобы открыть новую версию?' 'Restart ZAMENAIP now to open the new version?')"; then
+      exec "$BIN_LINK"
+    fi
+  fi
+}
+
+update_screen() {
+  update_app menu || true
+  pause_menu
+}
+
 # ---------- Main menu ----------
 
 main_menu() {
@@ -1120,6 +1281,7 @@ main_menu() {
     printf '  5) %s\n' "$(T 'Проверить сайт и DNS' 'Check website and DNS')"
     printf '  6) %s\n' "$(T 'Настройки / язык' 'Settings / language')"
     printf '  7) %s\n' "$(T 'Справка оператору' 'Operator guide')"
+    printf '  8) %s\n' "$(T 'Обновить ZAMENAIP' 'Update ZAMENAIP')"
     printf '  0) %s\n' "$(T 'Выход' 'Exit')"
     printf '\n%b%s%b\n' "$C_DIM" "$(T 'Подсказка: в любом вложенном меню 0 = назад.' 'Tip: 0 means Back in every submenu.')" "$C_RESET"
 
@@ -1132,6 +1294,7 @@ main_menu() {
       5) site_check_screen ;;
       6) settings_menu ;;
       7) help_screen ;;
+      8) update_screen ;;
       0) clear_screen; exit 0 ;;
       *) warn "$(T 'Нет такого пункта.' 'No such menu item.')"; sleep 1 ;;
     esac
@@ -1152,6 +1315,9 @@ Usage:
   sudo zamenaip backup          Create backup
   sudo zamenaip rollback        Open backup/restore menu
   sudo zamenaip language        Change language
+  sudo zamenaip update          Update from GitHub
+  sudo zamenaip update --force  Reinstall current GitHub version
+  sudo zamenaip repair          Repair /usr/local/bin/zamenaip
   zamenaip --version
 EOF_USAGE
 }
@@ -1163,6 +1329,9 @@ status_cli() {
 
 main() {
   local cmd="${1:-menu}"
+  if (( $# > 0 )); then
+    shift
+  fi
   case "$cmd" in
     --version|version) printf '%s %s\n' "$APP" "$VERSION"; return 0 ;;
     -h|--help|help) usage; return 0 ;;
@@ -1182,6 +1351,8 @@ main() {
     backup) printf '%s\n' "$(create_backup manual-cli)" ;;
     rollback) backup_menu ;;
     language) choose_language ;;
+    update) update_app cli "$@" ;;
+    repair) repair_screen ;;
     *) usage; exit 2 ;;
   esac
 }

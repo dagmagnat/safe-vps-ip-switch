@@ -28,6 +28,7 @@ ZAMENAIP - Safe VPS IPv4 Switch
   5) Проверить сайт и DNS
   6) Настройки / язык
   7) Справка оператору
+  8) Обновить ZAMENAIP
   0) Выход
 ```
 
@@ -55,6 +56,8 @@ ZAMENAIP - Safe VPS IPv4 Switch
 - список резервных копий и восстановление через меню;
 - страховочный backup перед каждым restore;
 - подтверждение перед reboot;
+- встроенное обновление из GitHub командой `sudo zamenaip update`;
+- автоматическое исправление старой/неправильной команды `/usr/local/bin/zamenaip` при установке;
 - журнал `/var/log/safe-vps-ip-switch.log`.
 
 ## Важное ограничение
@@ -67,11 +70,21 @@ ZAMENAIP - Safe VPS IPv4 Switch
 
 ## Установка
 
+Обычная установка из GitHub:
+
 ```bash
 git clone https://github.com/dagmagnat/safe-vps-ip-switch.git
 cd safe-vps-ip-switch
 sudo ./install.sh
 ```
+
+Можно установить одной командой без `git clone`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dagmagnat/safe-vps-ip-switch/main/install.sh | sudo bash
+```
+
+Удалённый установщик сам скачает полный проект, проверит Bash-синтаксис и создаст команду `zamenaip`.
 
 Установщик:
 
@@ -91,6 +104,50 @@ sudo ./install.sh --no-start
 
 ```bash
 sudo zamenaip
+```
+
+
+## Обновление
+
+После установки больше не нужно повторно клонировать репозиторий. Для обновления до версии из GitHub:
+
+```bash
+sudo zamenaip update
+```
+
+Скрипт:
+
+- скачивает свежую копию `dagmagnat/safe-vps-ip-switch`;
+- проверяет Bash-синтаксис до установки;
+- показывает текущую и новую версии;
+- сохраняет резервную копию текущей программы в `/var/backups/safe-vps-ip-switch/`;
+- запускает новый `install.sh --no-start`;
+- заново создаёт правильную ссылку `/usr/local/bin/zamenaip`;
+- не меняет Netplan, текущий IP, язык, состояние последней замены и сетевые backup.
+
+Принудительно переустановить ту же версию:
+
+```bash
+sudo zamenaip update --force
+```
+
+Если на сервере осталась старая версия проекта, в которой команды `update` ещё нет, выполните одноразовое восстановление установщика:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dagmagnat/safe-vps-ip-switch/main/install.sh | sudo bash -s -- --no-start
+```
+
+После этого доступны:
+
+```bash
+sudo zamenaip
+sudo zamenaip update
+```
+
+Если повреждена только быстрая команда, но новый скрипт уже запущен напрямую из репозитория:
+
+```bash
+sudo ./safe-vps-ip-switch.sh repair
 ```
 
 ## Типовой сценарий для сотрудника
@@ -158,6 +215,8 @@ sudo zamenaip backup       # создать backup
 sudo zamenaip rollback     # меню восстановления
 sudo zamenaip language     # изменить язык
 sudo zamenaip status       # состояние сети
+sudo zamenaip update       # обновить программу из GitHub
+sudo zamenaip repair       # исправить команду /usr/local/bin/zamenaip
 zamenaip --version
 ```
 
