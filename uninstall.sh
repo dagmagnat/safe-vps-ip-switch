@@ -1,27 +1,33 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_NAME="safe-vps-ip-switch"
-QUICK_COMMAND="zamenaip"
-INSTALL_DIR="/usr/local/lib/${APP_NAME}"
-BIN_LINK="/usr/local/bin/${QUICK_COMMAND}"
+APP="safe-vps-ip-switch"
+INSTALL_DIR="/usr/local/lib/${APP}"
+BIN_LINK="/usr/local/bin/zamenaip"
+CONFIG_FILE="/etc/${APP}.conf"
+STATE_DIR="/var/lib/${APP}"
+BACKUP_ROOT="/var/backups/${APP}"
+LOG_FILE="/var/log/${APP}.log"
+MANAGED_NETPLAN="/etc/netplan/99-zamenaip.yaml"
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  echo "Run as root: sudo ./uninstall.sh" >&2
+  echo "Run as root / Запустите от root: sudo ./uninstall.sh" >&2
   exit 1
 fi
 
 rm -f "$BIN_LINK"
 rm -rf "$INSTALL_DIR"
 
-cat <<'MSG'
-Removed the installed program and the `zamenaip` command.
+cat <<MSG
+ZAMENAIP executable removed / программа удалена.
 
-Safety data was intentionally kept:
-  /root/safe-vps-ip-switch-backups/
-  /var/lib/safe-vps-ip-switch/
-  /var/log/safe-vps-ip-switch.log
-  /etc/netplan/99-safe-vps-ip-switch.yaml
+For safety, the following were NOT removed / в целях безопасности НЕ удалены:
+  config:   $CONFIG_FILE
+  state:    $STATE_DIR
+  backups:  $BACKUP_ROOT
+  log:      $LOG_FILE
+  netplan:  $MANAGED_NETPLAN
 
-Remove those manually only if you are sure they are no longer needed.
+Review and remove them manually only if you no longer need them.
+Удаляйте их вручную только если уверены, что они больше не нужны.
 MSG

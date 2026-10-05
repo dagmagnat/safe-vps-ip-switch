@@ -1,220 +1,168 @@
-# safe-vps-ip-switch
+# ZAMENAIP — Safe VPS IPv4 Switch
 
-[Русская версия](README.ru.md)
+[Русская документация](README.ru.md)
 
-A cautious, interactive Bash utility for switching the primary public IPv4 of an Ubuntu VPS that uses **Netplan**.
+Quick operator checklist: [docs/OPERATOR-GUIDE.md](docs/OPERATOR-GUIDE.md)
 
-Designed after a real failure mode where the old VPS IP could no longer reach an upstream service, while a newly attached provider IP worked correctly.
+`ZAMENAIP` is an interactive Bash utility for safely changing the primary IPv4 address on Ubuntu VPS hosts using Netplan. It is designed for operators who may not remember Linux networking commands and need a guided, reversible workflow.
 
-Repository suggestion: **`dagmagnat/safe-vps-ip-switch`**
-
-## Safety goals
-
-The script is intentionally conservative:
-
-- shows the current public IP, interface and gateway before changing anything;
-- asks for the new IP (gateway is suggested for `/24` networks);
-- backs up `/etc/netplan` and `/etc/nginx` before changes;
-- temporarily adds the new IP and checks outbound connectivity from it;
-- writes a separate Netplan override instead of destructively rewriting cloud-init files;
-- validates Netplan with `netplan generate`;
-- updates existing active nginx `proxy_bind OLD_IP;` entries to the new IP, if present;
-- validates nginx with `nginx -t`;
-- applies networking with `netplan try --timeout 120`, so an unconfirmed broken config is automatically reverted;
-- verifies the selected route source and public IPv4;
-- supports post-reboot verification and rollback;
-- **never deletes/releases the old IP in the hosting provider panel**.
-
-## Supported systems
-
-- Ubuntu 22.04 / 24.04 and similar systems using Netplan
-- root access
-- IPv4 migration
-- `/24` is the default prefix, but another prefix can be supplied
-
-The provider must already have attached/routed the new public IP to the VPS before running the switch.
-
-## Install
-
-```bash
-sudo apt update
-sudo apt install -y curl python3
-
-git clone https://github.com/dagmagnat/safe-vps-ip-switch.git
-cd safe-vps-ip-switch
-sudo ./install.sh
-```
-
-The installer creates a short system-wide command:
-
-```bash
-zamenaip
-```
-
-The program is copied to `/usr/local/lib/safe-vps-ip-switch/` and `/usr/local/bin/zamenaip` is created as a symlink. Netplan is normally already installed on supported Ubuntu VPS images.
-
-## Quick start
-
-Start a safe interactive switch from any directory:
+After installation, just run:
 
 ```bash
 sudo zamenaip
 ```
 
-Show the current network state:
+On first launch, choose **Русский** or **English**. The choice is saved and can be changed later in Settings.
 
-```bash
-zamenaip status
-```
-
-Example interaction:
+## Main menu
 
 ```text
-Current network
-  Public IPv4 : 194.87.133.17
-  Interface   : eth0
-  Gateway     : 194.87.133.1
+ZAMENAIP - Safe VPS IPv4 Switch
 
-New public IPv4: 5.42.120.63
-Gateway [5.42.120.1]:
+Current public IPv4: 5.42.120.63    Interface: eth0
+
+  1) IP status and diagnostics
+  2) Change primary IPv4
+  3) Verify after switch / reboot
+  4) Backups and restore
+  5) Check website and DNS
+  6) Settings / language
+  7) Operator guide
+  0) Exit
 ```
 
-For a known website, add a domain check:
+`0` always means **Back** inside submenus.
+
+## Highlights
+
+- first-run Russian/English language selection;
+- persistent language, DNS, and optional website domain settings;
+- current public IPv4, interface, gateway, source route, and address inventory;
+- outbound connectivity test for each IPv4 already configured in Linux;
+- choose a detected IPv4 or enter one manually;
+- temporarily add a manually entered IP for preflight testing;
+- test the candidate IP and gateway before persistent changes;
+- automatically suggest the first host of the IPv4 subnet as a likely gateway;
+- timestamped Netplan/nginx/network-state backups;
+- `netplan try --timeout 120` rollback protection;
+- verify that the selected IPv4 actually became the public/source address;
+- update exact active nginx `proxy_bind OLD_IP;` and `listen OLD_IP:PORT` directives;
+- run `nginx -t` before reload;
+- local and public website checks;
+- DNS A-record diagnostics and operator guidance;
+- post-reboot verification;
+- interactive backup listing and restore;
+- safety backup before restore;
+- explicit confirmation before reboot;
+- audit log at `/var/log/safe-vps-ip-switch.log`.
+
+## Provider/API limitation
+
+This project is provider-neutral. It can list IPv4 addresses already visible in Linux, but it cannot generically discover an IP that exists only in a Timeweb/other provider control panel and has not yet been configured in the OS.
+
+Use **Enter a new IPv4 manually** in that case. ZAMENAIP temporarily adds the address and verifies real outbound connectivity before changing persistent networking.
+
+The same applies to DNS: automatic DNS changes require a provider-specific API. ZAMENAIP checks DNS and tells the operator which A record should point to the new address.
+
+## Installation
 
 ```bash
-sudo zamenaip switch --domain hasdgu.ru
-```
-
-Non-default network:
-
-```bash
-sudo zamenaip switch \
-  --new-ip 203.0.113.25 \
-  --prefix 24 \
-  --gateway 203.0.113.1 \
-  --domain example.com
-```
-
-## What happens during the switch
-
-The tool creates a timestamped backup under:
-
-```text
-/root/safe-vps-ip-switch-backups/YYYYMMDD-HHMMSS/
-```
-
-Then it creates:
-
-```text
-/etc/netplan/99-safe-vps-ip-switch.yaml
-```
-
-The persistent configuration uses the new IPv4, disables DHCPv4 in the merged Netplan config, installs the new default gateway, and keeps any unrelated settings from earlier Netplan files unless overridden.
-
-The final network change is performed with:
-
-```bash
-netplan try --timeout 120
-```
-
-**Keep the SSH window open.** Confirm the configuration only if SSH and connectivity still work.
-
-## After reboot
-
-Do not detach the old provider IP yet. Reboot first:
-
-```bash
-sudo reboot
-```
-
-Reconnect using the **new** IP and run:
-
-```bash
-sudo zamenaip verify
-```
-
-Only when verification succeeds should you detach the old IP in the hosting provider control panel. Verify again before permanently deleting/releasing the old IP.
-
-## Rollback
-
-Restore the latest backup:
-
-```bash
-sudo zamenaip rollback
-```
-
-Or restore a specific backup:
-
-```bash
-sudo zamenaip rollback /root/safe-vps-ip-switch-backups/20261005-120000
-```
-
-Rollback restores the backed-up Netplan and nginx configuration and reapplies networking.
-
-## nginx behavior
-
-The script does **not** rewrite `proxy_pass` targets. If an active nginx site already contains a literal binding such as:
-
-```nginx
-proxy_bind 194.87.133.17;
-```
-
-it is changed to:
-
-```nginx
-proxy_bind NEW_IP;
-```
-
-and nginx is validated before reload.
-
-If you do not want nginx touched at all:
-
-```bash
-sudo zamenaip switch --skip-nginx
-```
-
-## Important provider note
-
-This project changes the VPS operating-system network configuration only. It does not call Timeweb Cloud or any other provider API.
-
-Attach/buy the new IP in the provider panel first. Delete/release the old provider IP only after the new configuration survives a reboot and `verify` passes.
-
-## Logs and state
-
-Log:
-
-```text
-/var/log/safe-vps-ip-switch.log
-```
-
-State used for post-reboot verification:
-
-```text
-/var/lib/safe-vps-ip-switch/current.env
-```
-
-## Project scope
-
-This tool intentionally does not try to support every Linux network manager or every hosting provider. Keeping the scope to Ubuntu + Netplan makes rollback behavior and safety checks easier to reason about.
-
-## Updating
-
-After `git pull`, run the installer again:
-
-```bash
+git clone https://github.com/dagmagnat/safe-vps-ip-switch.git
+cd safe-vps-ip-switch
 sudo ./install.sh
 ```
 
-It atomically replaces the installed copy while keeping the same `zamenaip` command.
+The installer checks dependencies, installs missing packages through `apt-get` when available, installs the application under `/usr/local/lib/safe-vps-ip-switch/`, and creates the short command `/usr/local/bin/zamenaip`.
 
-## Uninstall
+To install without launching the menu immediately:
 
 ```bash
-sudo ./uninstall.sh
+sudo ./install.sh --no-start
 ```
 
-The uninstaller removes only the installed program and `zamenaip` command. Backups, state, logs, and the active Netplan file are intentionally preserved.
+Then run from any directory:
+
+```bash
+sudo zamenaip
+```
+
+## Recommended operator workflow
+
+1. Attach the new IPv4 to the VPS in the hosting-provider control panel, but keep the old IP.
+2. SSH into the VPS.
+3. Run `sudo zamenaip`.
+4. Use option `1` to inspect the current state.
+5. Use option `2` to start the guided IP switch.
+6. Choose a detected IP or enter it manually.
+7. Let ZAMENAIP test the IP and gateway.
+8. Confirm the backup and `netplan try` step.
+9. Keep the SSH session open until Netplan asks you to confirm the new settings.
+10. Check the website and DNS.
+11. Reboot when prompted or reboot manually.
+12. Run `sudo zamenaip` again and use option `3`.
+13. Only after successful post-reboot verification, detach the old provider IP.
+14. Verify once more, then permanently release/delete the old provider IP if desired.
+
+## Backups
+
+Create one manually with:
+
+```bash
+sudo zamenaip backup
+```
+
+Default location:
+
+```text
+/var/backups/safe-vps-ip-switch/
+```
+
+Each backup contains Netplan, nginx when present, `ip addr`, all routes, `netplan get`, and network metadata.
+
+Restore through the main menu, option `4`. ZAMENAIP creates an additional safety backup before restore.
+
+## CLI shortcuts
+
+```bash
+sudo zamenaip              # main menu
+sudo zamenaip switch       # guided switch wizard
+sudo zamenaip verify       # verify last switch
+sudo zamenaip backup       # create a backup
+sudo zamenaip rollback     # backup/restore menu
+sudo zamenaip language     # change language
+sudo zamenaip status       # network status
+zamenaip --version
+```
+
+## Files and state
+
+```text
+/etc/safe-vps-ip-switch.conf          language, domain, DNS settings
+/etc/netplan/99-zamenaip.yaml         managed Netplan file
+/var/lib/safe-vps-ip-switch/          last-switch state
+/var/backups/safe-vps-ip-switch/      backups
+/var/log/safe-vps-ip-switch.log       log
+/usr/local/bin/zamenaip               quick command
+```
+
+## Supported environment
+
+Primary target:
+
+- Ubuntu 22.04 / 24.04;
+- Netplan;
+- standard server networking / systemd-networkd;
+- IPv4;
+- nginx integration is optional.
+
+The project intentionally does not rewrite CentOS/AlmaLinux, non-Netplan Debian, NetworkManager, or provider-control-plane networking automatically.
+
+## Safety
+
+Remote network changes can always interrupt SSH. On critical systems, keep your provider web/VNC/serial console available.
+
+ZAMENAIP **never releases or deletes an IP from the hosting-provider panel**. Permanent provider-side removal is intentionally left to the operator after successful post-reboot verification.
 
 ## License
 
-MIT
+MIT.

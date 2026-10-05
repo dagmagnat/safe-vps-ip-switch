@@ -1,95 +1,211 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-PROGRAM="safe-vps-ip-switch"
-VERSION="1.1.0"
-STATE_DIR="/var/lib/${PROGRAM}"
-BACKUP_ROOT="/root/${PROGRAM}-backups"
-LOG_FILE="/var/log/${PROGRAM}.log"
-NETPLAN_FILE="/etc/netplan/99-safe-vps-ip-switch.yaml"
+APP="safe-vps-ip-switch"
+DISPLAY_NAME="ZAMENAIP"
+VERSION="2.0.0"
+CONFIG_FILE="/etc/${APP}.conf"
+STATE_DIR="/var/lib/${APP}"
+BACKUP_ROOT="/var/backups/${APP}"
+LOG_FILE="/var/log/${APP}.log"
+MANAGED_NETPLAN="/etc/netplan/99-zamenaip.yaml"
 TRY_TIMEOUT=120
+ROUTE_TABLE=51820
+ROUTE_RULE_PRIORITY=10990
 
-# Defaults. Override with flags where documented.
-PREFIX="24"
+LANGUAGE=""
+DEFAULT_DOMAIN=""
 DNS1="1.1.1.1"
 DNS2="1.0.0.1"
-DOMAIN=""
-NEW_IP=""
-NEW_GW=""
-ASSUME_YES=0
-SKIP_NGINX=0
 
 C_RESET='\033[0m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
 C_RED='\033[31m'
 C_GREEN='\033[32m'
 C_YELLOW='\033[33m'
+C_BLUE='\033[34m'
 C_CYAN='\033[36m'
+
+ORIGINAL_ARGS=("$@")
+TEMP_ADDED_CIDR=""
+TEMP_IFACE=""
+
+# ---------- UI ----------
+
+T() {
+  if [[ "${LANGUAGE:-ru}" == "en" ]]; then
+    printf '%s' "$2"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+clear_screen() {
+  if [[ -t 1 ]] && command -v clear >/dev/null 2>&1; then
+    clear || true
+  fi
+}
+
+rule() {
+  printf '%b%s%b\n' "$C_DIM" '------------------------------------------------------------------------' "$C_RESET"
+}
+
+logo() {
+  printf '%b%b' "$C_CYAN" "$C_BOLD"
+  cat <<'LOGO'
+  ______  ___    __  ___ ______ _   __ ___     ______ ____
+ /_  __/ /   |  /  |/  // ____// | / //   |   /  _/ // __ \
+  / /   / /| | / /|_/ // __/  /  |/ // /| |   / // // /_/ /
+ / /   / ___ |/ /  / // /___ / /|  // ___ | _/ // // ____/
+/_/   /_/  |_/_/  /_//_____//_/ |_//_/  |_|/___/_//_/
+LOGO
+  printf '%b' "$C_RESET"
+  printf '%b%s%b  v%s\n' "$C_BOLD" "Safe VPS IPv4 Switch" "$C_RESET" "$VERSION"
+  printf '%s\n' "$(T 'Безопасная смена основного IPv4 для Ubuntu/Netplan' 'Safe primary IPv4 switching for Ubuntu/Netplan')"
+  rule
+}
+
+header() {
+  clear_screen
+  logo
+  printf '%b%s%b\n\n' "$C_BOLD" "$1" "$C_RESET"
+}
+
+info() { printf '%b[INFO]%b %s\n' "$C_CYAN" "$C_RESET" "$*"; log "INFO: $*"; }
+ok()   { printf '%b[ OK ]%b %s\n' "$C_GREEN" "$C_RESET" "$*"; log "OK: $*"; }
+warn() { printf '%b[WARN]%b %s\n' "$C_YELLOW" "$C_RESET" "$*"; log "WARN: $*"; }
+err()  { printf '%b[ERR ]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; log "ERROR: $*"; }
 
 log() {
   local msg="$*"
-  printf '%b[%s]%b %s\n' "$C_CYAN" "$PROGRAM" "$C_RESET" "$msg"
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
   printf '[%s] %s\n' "$(date -Is)" "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-ok()   { printf '%bOK%b  %s\n' "$C_GREEN" "$C_RESET" "$*"; log "OK: $*" >/dev/null; }
-warn() { printf '%bWARN%b %s\n' "$C_YELLOW" "$C_RESET" "$*"; log "WARN: $*" >/dev/null; }
-die()  { printf '%bERROR%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; log "ERROR: $*" >/dev/null; exit 1; }
-
-usage() {
-  cat <<'USAGE'
-Safe VPS IP Switch
-
-Usage:
-  sudo zamenaip                         # interactive safe IP switch
-  sudo zamenaip [options]               # same switch, with options
-  sudo zamenaip switch [options]
-  sudo zamenaip verify
-  sudo zamenaip rollback [backup-dir]
-  zamenaip status
-
-Without a subcommand, the script starts the interactive `switch` flow.
-The original ./safe-vps-ip-switch.sh command remains supported.
-
-Switch options:
-  --new-ip IP       New public IPv4. If omitted, the script asks interactively.
-  --gateway IP      New gateway. If omitted and prefix is /24, defaults to X.Y.Z.1.
-  --prefix N        IPv4 prefix length. Default: 24.
-  --domain NAME     Optional site domain to verify locally and publicly.
-  --dns1 IP         Primary DNS. Default: 1.1.1.1.
-  --dns2 IP         Secondary DNS. Default: 1.0.0.1.
-  --skip-nginx      Do not update existing nginx proxy_bind entries.
-  -y, --yes         Skip non-critical confirmation prompts. netplan try still requires confirmation.
-  -h, --help        Show this help.
-
-What switch does:
-  1. Detects current public IPv4, interface and default gateway.
-  2. Asks only for the new IP unless flags are supplied.
-  3. Creates timestamped backups of /etc/netplan and /etc/nginx.
-  4. Temporarily adds the new IP and checks the new gateway.
-  5. Verifies the new IP can reach the Internet before changing persistent networking.
-  6. Writes a Netplan override and validates it.
-  7. Updates existing nginx proxy_bind OLD_IP entries to NEW_IP (if present).
-  8. Runs nginx -t.
-  9. Uses `netplan try --timeout 120`, so an unconfirmed broken network is reverted automatically.
- 10. Verifies public IPv4, routing, nginx and the optional domain.
-
-The script NEVER removes or releases the old IP in your hosting provider panel.
-Do that only after `verify` succeeds after a reboot.
-USAGE
+pause_menu() {
+  printf '\n'
+  read -r -p "$(T 'Нажмите Enter, чтобы продолжить...' 'Press Enter to continue...')" _ || true
 }
 
-require_root() {
-  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root: sudo $0 $*"
+read_menu_choice() {
+  local prompt="$1" value
+  while true; do
+    read -r -p "$prompt" value || return 1
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    printf '%b%s%b\n' "$C_YELLOW" "$(T 'Введите номер пункта.' 'Enter a menu number.')" "$C_RESET" >&2
+  done
+}
+
+confirm_choice() {
+  local question="$1" choice
+  printf '\n%s\n' "$question"
+  printf '  1) %s\n' "$(T 'Да, продолжить' 'Yes, continue')"
+  printf '  2) %s\n' "$(T 'Нет' 'No')"
+  printf '  0) %s\n' "$(T 'Назад' 'Back')"
+  while true; do
+    choice="$(read_menu_choice "> ")" || return 2
+    case "$choice" in
+      1) return 0 ;;
+      2) return 1 ;;
+      0) return 2 ;;
+      *) warn "$(T 'Нет такого пункта.' 'No such menu item.')" ;;
+    esac
+  done
+}
+
+# ---------- Config / language ----------
+
+ensure_dirs() {
+  mkdir -p "$STATE_DIR" "$BACKUP_ROOT"
+  chmod 700 "$STATE_DIR" "$BACKUP_ROOT" 2>/dev/null || true
+}
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+  LANGUAGE="${LANGUAGE:-}"
+  DEFAULT_DOMAIN="${DEFAULT_DOMAIN:-}"
+  DNS1="${DNS1:-1.1.1.1}"
+  DNS2="${DNS2:-1.0.0.1}"
+}
+
+save_config() {
+  ensure_dirs
+  {
+    printf 'LANGUAGE=%q\n' "$LANGUAGE"
+    printf 'DEFAULT_DOMAIN=%q\n' "$DEFAULT_DOMAIN"
+    printf 'DNS1=%q\n' "$DNS1"
+    printf 'DNS2=%q\n' "$DNS2"
+  } > "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+}
+
+choose_language() {
+  local c
+  clear_screen
+  printf '%b%bZAMENAIP%b - Language / Язык\n' "$C_CYAN" "$C_BOLD" "$C_RESET"
+  rule
+  printf '  1) Русский\n'
+  printf '  2) English\n'
+  printf '\n'
+  while true; do
+    c="$(read_menu_choice "> ")" || exit 1
+    case "$c" in
+      1) LANGUAGE="ru"; break ;;
+      2) LANGUAGE="en"; break ;;
+      *) printf '%s\n' '1 / 2' ;;
+    esac
+  done
+  save_config
+}
+
+ensure_language() {
+  [[ "$LANGUAGE" == "ru" || "$LANGUAGE" == "en" ]] || choose_language
+}
+
+# ---------- Privileges / dependencies ----------
+
+ensure_root_for_menu() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    printf '%s\n' 'ZAMENAIP needs administrator privileges / нужны права администратора.'
+    exec sudo -E "$0" "${ORIGINAL_ARGS[@]}"
+  fi
+  printf '%s\n' 'Run as root / Запустите от root.' >&2
+  exit 1
 }
 
 need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+  command -v "$1" >/dev/null 2>&1 || {
+    err "$(T "Не найдена команда: $1" "Required command not found: $1")"
+    return 1
+  }
 }
 
+check_base_dependencies() {
+  local c missing=()
+  for c in ip curl awk sed grep tar python3 netplan; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    err "$(T 'Не хватает системных команд:' 'Missing system commands:') ${missing[*]}"
+    printf '%s\n' "$(T 'Запустите установщик повторно или установите зависимости вручную.' 'Run the installer again or install the dependencies manually.')"
+    return 1
+  fi
+}
+
+# ---------- Network helpers ----------
+
 is_ipv4() {
-  local ip="$1"
-  python3 - "$ip" <<'PY' >/dev/null 2>&1
+  python3 - "$1" <<'PY' >/dev/null 2>&1
 import ipaddress, sys
 try:
     ipaddress.IPv4Address(sys.argv[1])
@@ -98,24 +214,56 @@ except Exception:
 PY
 }
 
-calc_gateway_24() {
-  local ip="$1"
-  python3 - "$ip" <<'PY'
+is_prefix() {
+  [[ "$1" =~ ^([0-9]|[12][0-9]|3[0-2])$ ]]
+}
+
+network_first_host() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
 import ipaddress, sys
 ip = ipaddress.IPv4Address(sys.argv[1])
-net = ipaddress.IPv4Network(f"{ip}/24", strict=False)
+p = int(sys.argv[2])
+net = ipaddress.IPv4Network(f"{ip}/{p}", strict=False)
+if net.num_addresses < 4:
+    raise SystemExit(1)
 print(next(net.hosts()))
 PY
 }
 
+current_iface() {
+  ip -4 route show default 2>/dev/null | head -n1 | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'
+}
+
+current_gateway() {
+  ip -4 route show default 2>/dev/null | head -n1 | awk '{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}'
+}
+
+current_route_src() {
+  local src
+  src="$(ip -4 route show default 2>/dev/null | head -n1 | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')"
+  if [[ -z "$src" ]]; then
+    src="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')"
+  fi
+  printf '%s\n' "$src"
+}
+
+public_ipv4_once() {
+  local bind_ip="${1:-}" url="${2:-https://api.ipify.org}" out
+  local opts=(-4fsS --connect-timeout 4 --max-time 7)
+  [[ -n "$bind_ip" ]] && opts+=(--interface "$bind_ip")
+  out="$(curl "${opts[@]}" "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ -n "$out" ]] && is_ipv4 "$out"; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  return 1
+}
+
 public_ipv4() {
-  local bind_ip="${1:-}"
-  local opt=()
-  [[ -n "$bind_ip" ]] && opt=(--interface "$bind_ip")
-  local url out
-  for url in "https://ifconfig.me/ip" "https://api.ipify.org" "https://icanhazip.com"; do
-    out="$(curl -4fsS --connect-timeout 5 --max-time 10 "${opt[@]}" "$url" 2>/dev/null | tr -d '[:space:]' || true)"
-    if [[ -n "$out" ]] && is_ipv4 "$out"; then
+  local bind_ip="${1:-}" out url
+  for url in 'https://api.ipify.org' 'https://ifconfig.me/ip' 'https://icanhazip.com'; do
+    out="$(public_ipv4_once "$bind_ip" "$url" || true)"
+    if [[ -n "$out" ]]; then
       printf '%s\n' "$out"
       return 0
     fi
@@ -123,409 +271,919 @@ public_ipv4() {
   return 1
 }
 
-current_iface() {
-  ip -4 route show default | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'
-}
-
-current_gateway() {
-  ip -4 route show default | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}'
-}
-
-current_route_src() {
-  ip -4 route show default | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}'
-}
-
-first_global_ipv4_on_iface() {
+local_ipv4_cidrs() {
   local iface="$1"
-  ip -4 -o addr show dev "$iface" scope global | awk 'NR==1 {split($4,a,"/"); print a[1]}'
+  ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4}'
 }
 
-confirm() {
-  local prompt="$1"
-  if [[ "$ASSUME_YES" -eq 1 ]]; then
-    return 0
+cidr_ip() { printf '%s\n' "${1%%/*}"; }
+cidr_prefix() { printf '%s\n' "${1#*/}"; }
+
+iface_has_ip() {
+  local iface="$1" ipaddr="$2"
+  ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' | grep -Fxq "$ipaddr"
+}
+
+cleanup_probe_route() {
+  while ip -4 rule del priority "$ROUTE_RULE_PRIORITY" >/dev/null 2>&1; do :; done
+  ip -4 route flush table "$ROUTE_TABLE" >/dev/null 2>&1 || true
+  ip -4 route flush cache >/dev/null 2>&1 || true
+}
+
+cleanup_temp_ip() {
+  cleanup_probe_route
+  if [[ -n "$TEMP_ADDED_CIDR" && -n "$TEMP_IFACE" ]]; then
+    ip addr del "$TEMP_ADDED_CIDR" dev "$TEMP_IFACE" >/dev/null 2>&1 || true
   fi
-  local ans
-  read -r -p "$prompt [y/N]: " ans
-  [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]]
+  TEMP_ADDED_CIDR=""
+  TEMP_IFACE=""
 }
 
-backup_all() {
-  local stamp backup
-  stamp="$(date +%Y%m%d-%H%M%S)"
-  backup="${BACKUP_ROOT}/${stamp}"
-  mkdir -p "$backup"
+trap cleanup_temp_ip EXIT
 
-  tar -C / -czf "$backup/netplan.tgz" etc/netplan
-  if [[ -d /etc/nginx ]]; then
-    tar -C / -czf "$backup/nginx.tgz" etc/nginx
+probe_ip_gateway() {
+  local iface="$1" ipaddr="$2" gateway="$3" result
+  cleanup_probe_route
+
+  if ! ip -4 route add default via "$gateway" dev "$iface" src "$ipaddr" onlink table "$ROUTE_TABLE" >/dev/null 2>&1; then
+    cleanup_probe_route
+    return 1
   fi
-  ip addr show > "$backup/ip-addr.txt"
-  ip route show table all > "$backup/ip-route.txt"
-  netplan get > "$backup/netplan-get.txt" 2>&1 || true
-  printf '%s\n' "$backup" > "${STATE_DIR}/latest-backup"
-  printf '%s\n' "$backup"
-}
-
-save_state() {
-  local backup="$1" iface="$2" old_ip="$3" old_gw="$4"
-  mkdir -p "$STATE_DIR"
-  cat > "${STATE_DIR}/current.env" <<EOFSTATE
-TARGET_IP='$NEW_IP'
-TARGET_GW='$NEW_GW'
-PREFIX='$PREFIX'
-IFACE='$iface'
-OLD_IP='$old_ip'
-OLD_GW='$old_gw'
-DOMAIN='$DOMAIN'
-BACKUP_DIR='$backup'
-CREATED_AT='$(date -Is)'
-EOFSTATE
-  chmod 600 "${STATE_DIR}/current.env"
-}
-
-rollback_from() {
-  local backup="$1"
-  [[ -d "$backup" ]] || die "Backup directory not found: $backup"
-  [[ -f "$backup/netplan.tgz" ]] || die "Missing $backup/netplan.tgz"
-
-  warn "Restoring network configuration from: $backup"
-  rm -f "$NETPLAN_FILE"
-  tar -C / -xzf "$backup/netplan.tgz"
-
-  if [[ -f "$backup/nginx.tgz" ]]; then
-    tar -C / -xzf "$backup/nginx.tgz"
+  if ! ip -4 rule add priority "$ROUTE_RULE_PRIORITY" from "$ipaddr/32" lookup "$ROUTE_TABLE" >/dev/null 2>&1; then
+    cleanup_probe_route
+    return 1
   fi
+  ip -4 route flush cache >/dev/null 2>&1 || true
 
-  netplan generate || die "Restored Netplan files, but netplan generate failed. Inspect /etc/netplan manually."
-  warn "Applying restored network configuration. Existing SSH session may briefly pause."
-  netplan apply
-
-  if command -v nginx >/dev/null 2>&1; then
-    nginx -t && systemctl reload nginx || warn "nginx restore needs manual attention."
-  fi
-  ok "Rollback completed."
+  result="$(public_ipv4_once "$ipaddr" || true)"
+  cleanup_probe_route
+  [[ "$result" == "$ipaddr" ]]
 }
 
-update_nginx_proxy_bind() {
-  local old_ip="$1" new_ip="$2"
-  [[ "$SKIP_NGINX" -eq 0 ]] || { warn "Skipping nginx changes (--skip-nginx)."; return 0; }
-  command -v nginx >/dev/null 2>&1 || return 0
-  [[ -d /etc/nginx/sites-enabled ]] || return 0
-
-  local files changed=0 f real tmp
-  mapfile -t files < <(find /etc/nginx/sites-enabled -maxdepth 1 -type f -o -type l 2>/dev/null | sort)
-  for f in "${files[@]}"; do
-    real="$(readlink -f "$f" 2>/dev/null || printf '%s' "$f")"
-    [[ -f "$real" ]] || continue
-    if grep -Eq "^[[:space:]]*proxy_bind[[:space:]]+${old_ip//./\\.}[[:space:]]*;" "$real"; then
-      tmp="$(mktemp)"
-      sed -E "s#^([[:space:]]*proxy_bind[[:space:]]+)${old_ip//./\\.}([[:space:]]*;)#\\1${new_ip}\\2#" "$real" > "$tmp"
-      cat "$tmp" > "$real"
-      rm -f "$tmp"
-      log "Updated proxy_bind in $real: $old_ip -> $new_ip"
-      changed=1
-    fi
-  done
-
-  if [[ "$changed" -eq 1 ]]; then
-    nginx -t || die "nginx -t failed after proxy_bind update. Run rollback to restore."
-    systemctl reload nginx
-    ok "nginx proxy_bind entries updated to $new_ip and reloaded."
-  else
-    log "No active nginx proxy_bind entries using $old_ip were found; nothing changed."
-  fi
+resolve_ipv4s() {
+  local host="$1"
+  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++'
 }
 
-auto_detect_domain() {
-  [[ -n "$DOMAIN" ]] && return 0
-  command -v nginx >/dev/null 2>&1 || return 0
-  local candidate
-  candidate="$(nginx -T 2>/dev/null | awk '
-    $1=="server_name" {
-      for(i=2;i<=NF;i++) {
-        gsub(";","",$i)
-        if($i !~ /^_/ && $i !~ /^localhost$/ && $i !~ /\\*/) { print $i; exit }
-      }
-    }' || true)"
-  [[ -n "$candidate" ]] && DOMAIN="$candidate"
+http_code() {
+  local url="$1" resolve_arg="${2:-}" code
+  local args=(-kIsS --connect-timeout 5 --max-time 15)
+  [[ -n "$resolve_arg" ]] && args+=(--resolve "$resolve_arg")
+  code="$(curl "${args[@]}" "$url" 2>/dev/null | awk 'NR==1 {print $2}' || true)"
+  printf '%s\n' "$code"
 }
 
-verify_domain() {
-  [[ -n "$DOMAIN" ]] || return 0
-  log "Testing site domain: $DOMAIN"
-  local code_local code_public
-  code_local="$(curl -kIsS --connect-timeout 5 --max-time 20 --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" 2>/dev/null | awk 'NR==1 {print $2}' || true)"
-  code_public="$(curl -kIsS --connect-timeout 5 --max-time 20 "https://${DOMAIN}/" 2>/dev/null | awk 'NR==1 {print $2}' || true)"
+# ---------- Status / diagnostics ----------
 
-  if [[ "$code_local" =~ ^[123][0-9][0-9]$ ]]; then
-    ok "Local nginx/domain test: HTTP $code_local"
-  else
-    warn "Local domain test did not return 1xx/2xx/3xx (got: ${code_local:-no response})."
-  fi
-  if [[ "$code_public" =~ ^[123][0-9][0-9]$ ]]; then
-    ok "Public domain test: HTTP $code_public"
-  else
-    warn "Public domain test did not return 1xx/2xx/3xx (DNS may still point to the old IP)."
-  fi
-}
-
-status_cmd() {
-  need_cmd ip
-  need_cmd curl
-  local iface gw pub src
+print_network_summary() {
+  local iface gw src pub
   iface="$(current_iface || true)"
   gw="$(current_gateway || true)"
   src="$(current_route_src || true)"
   pub="$(public_ipv4 || true)"
-  printf 'Public IPv4 : %s\n' "${pub:-unknown}"
-  printf 'Interface   : %s\n' "${iface:-unknown}"
-  printf 'Route source: %s\n' "${src:-unknown}"
-  printf 'Gateway     : %s\n' "${gw:-unknown}"
-  printf '\nIPv4 addresses:\n'
-  ip -4 -br addr show
-  printf '\nDefault routes:\n'
-  ip -4 route show default
+
+  printf '%-22s %s\n' "$(T 'Внешний IPv4:' 'Public IPv4:')" "${pub:-$(T 'не определён' 'unknown')}"
+  printf '%-22s %s\n' "$(T 'Интерфейс:' 'Interface:')" "${iface:-$(T 'не определён' 'unknown')}"
+  printf '%-22s %s\n' "$(T 'Исходный IPv4:' 'Route source:')" "${src:-$(T 'не определён' 'unknown')}"
+  printf '%-22s %s\n' "$(T 'Шлюз:' 'Gateway:')" "${gw:-$(T 'не определён' 'unknown')}"
+  printf '\n%s\n' "$(T 'IPv4 в Linux:' 'IPv4 addresses in Linux:')"
+  if [[ -n "$iface" ]]; then
+    ip -4 -br addr show dev "$iface" || true
+  else
+    ip -4 -br addr show || true
+  fi
+  printf '\n%s\n' "$(T 'Маршруты по умолчанию:' 'Default routes:')"
+  ip -4 route show default || true
 }
 
-verify_cmd() {
-  require_root verify
-  need_cmd ip
-  need_cmd curl
-  [[ -f "${STATE_DIR}/current.env" ]] || die "No saved state. Run switch first."
-  # shellcheck disable=SC1090
-  source "${STATE_DIR}/current.env"
+test_all_local_ips() {
+  local iface cidr ipaddr result count=0
+  iface="$(current_iface || true)"
+  [[ -n "$iface" ]] || { err "$(T 'Не удалось определить сетевой интерфейс.' 'Could not detect network interface.')"; return 1; }
 
-  log "Expected public IPv4: $TARGET_IP"
-  local pub route
-  pub="$(public_ipv4 || true)"
-  route="$(ip -4 route get 1.1.1.1 2>/dev/null || true)"
-
-  printf 'Public IPv4 : %s\n' "${pub:-unknown}"
-  printf 'Route       : %s\n' "$route"
-
-  [[ "$pub" == "$TARGET_IP" ]] || die "Public IPv4 is ${pub:-unknown}, expected $TARGET_IP. Do NOT release the old provider IP yet."
-  grep -q "src $TARGET_IP" <<<"$route" || die "Default route is not selecting source $TARGET_IP."
-
-  if command -v nginx >/dev/null 2>&1; then
-    nginx -t || die "nginx configuration test failed."
-  fi
-  verify_domain
-  ok "Post-reboot verification passed. It is now safe to detach the old provider IP, then verify once more before deleting it."
-}
-
-switch_cmd() {
-  require_root switch
-  need_cmd ip
-  need_cmd curl
-  need_cmd awk
-  need_cmd sed
-  need_cmd grep
-  need_cmd tar
-  need_cmd python3
-  need_cmd netplan
-
-  [[ -t 0 && -t 1 ]] || die "Run switch interactively from a terminal/SSH session."
-  [[ -d /etc/netplan ]] || die "This version supports Ubuntu/Netplan only."
-
-  local iface old_gw old_ip public_old suggested_gw backup test_public
-  iface="$(current_iface)"
-  [[ -n "$iface" ]] || die "Could not detect the default IPv4 interface."
-  old_gw="$(current_gateway || true)"
-  public_old="$(public_ipv4 || true)"
-  old_ip="${public_old:-$(current_route_src || true)}"
-  [[ -n "$old_ip" ]] || old_ip="$(first_global_ipv4_on_iface "$iface")"
-
-  printf '\nCurrent network\n'
-  printf '  Public IPv4 : %s\n' "${public_old:-unknown}"
-  printf '  Interface   : %s\n' "$iface"
-  printf '  Gateway     : %s\n' "${old_gw:-unknown}"
-  printf '  Addresses   : %s\n' "$(ip -4 -o addr show dev "$iface" scope global | awk '{print $4}' | xargs)"
-
-  if [[ -z "$NEW_IP" ]]; then
-    read -r -p "\nNew public IPv4: " NEW_IP
-  fi
-  is_ipv4 "$NEW_IP" || die "Invalid IPv4: $NEW_IP"
-  [[ "$NEW_IP" != "$old_ip" ]] || die "New IP equals current IP ($old_ip). Nothing to do."
-
-  [[ "$PREFIX" =~ ^([0-9]|[12][0-9]|3[0-2])$ ]] || die "Invalid prefix: $PREFIX"
-  if [[ -z "$NEW_GW" ]]; then
-    if [[ "$PREFIX" == "24" ]]; then
-      suggested_gw="$(calc_gateway_24 "$NEW_IP")"
-      read -r -p "Gateway [$suggested_gw]: " NEW_GW
-      NEW_GW="${NEW_GW:-$suggested_gw}"
+  printf '%s\n' "$(T 'Проверяем исходящий доступ каждого IPv4. Это может занять несколько секунд.' 'Testing outbound access for every IPv4. This can take a few seconds.')"
+  while IFS= read -r cidr; do
+    [[ -n "$cidr" ]] || continue
+    count=$((count + 1))
+    ipaddr="$(cidr_ip "$cidr")"
+    printf '  %-18s ... ' "$cidr"
+    result="$(public_ipv4_once "$ipaddr" || true)"
+    if [[ "$result" == "$ipaddr" ]]; then
+      printf '%bOK%b (%s)\n' "$C_GREEN" "$C_RESET" "$result"
+    elif [[ -n "$result" ]]; then
+      printf '%b%s%b -> %s\n' "$C_YELLOW" "$(T 'доступ есть, внешний IP другой' 'online, public IP differs')" "$C_RESET" "$result"
     else
-      read -r -p "Gateway for $NEW_IP/$PREFIX: " NEW_GW
+      printf '%b%s%b\n' "$C_RED" "$(T 'нет ответа' 'no response')" "$C_RESET"
+    fi
+  done < <(local_ipv4_cidrs "$iface")
+  (( count > 0 )) || warn "$(T 'Глобальные IPv4 не найдены.' 'No global IPv4 addresses found.')"
+}
+
+site_check_screen() {
+  local domain="${1:-$DEFAULT_DOMAIN}" dns_ips current code_local code_public input
+  header "$(T 'Проверка сайта и DNS' 'Website and DNS check')"
+
+  if [[ -n "$domain" ]]; then
+    read -r -p "$(T "Домен [$domain] (0 = назад): " "Domain [$domain] (0 = back): ")" input || return
+    [[ "$input" == "0" ]] && return
+    [[ -n "$input" ]] && domain="$input"
+  else
+    read -r -p "$(T 'Введите домен без https:// (0 = назад): ' 'Enter domain without https:// (0 = back): ')" domain || return
+    [[ "$domain" == "0" ]] && return
+  fi
+  domain="${domain#http://}"
+  domain="${domain#https://}"
+  domain="${domain%%/*}"
+  [[ -n "$domain" ]] || { warn "$(T 'Домен не указан.' 'No domain entered.')"; pause_menu; return; }
+
+  current="$(public_ipv4 || true)"
+  dns_ips="$(resolve_ipv4s "$domain" || true)"
+  printf '\n%-22s %s\n' "$(T 'Домен:' 'Domain:')" "$domain"
+  printf '%-22s %s\n' "$(T 'DNS IPv4:' 'DNS IPv4:')" "${dns_ips//$'\n'/, }"
+  printf '%-22s %s\n' "$(T 'IPv4 сервера:' 'Server public IPv4:')" "${current:-unknown}"
+
+  if [[ -n "$current" ]] && grep -Fxq "$current" <<<"$dns_ips"; then
+    ok "$(T 'DNS уже указывает на текущий IPv4 сервера.' 'DNS already points to the current server IPv4.')"
+  else
+    warn "$(T 'DNS не указывает на текущий IPv4. A-запись, возможно, нужно изменить у DNS-провайдера.' 'DNS does not point to the current IPv4. The A record may need updating at your DNS provider.')"
+  fi
+
+  code_local="$(http_code "https://${domain}/" "${domain}:443:127.0.0.1")"
+  code_public="$(http_code "https://${domain}/")"
+  printf '%-22s %s\n' "$(T 'Локально через nginx:' 'Local via web server:')" "${code_local:-$(T 'нет ответа' 'no response')}"
+  printf '%-22s %s\n' "$(T 'Через публичный DNS:' 'Via public DNS:')" "${code_public:-$(T 'нет ответа' 'no response')}"
+
+  if [[ "$code_local" =~ ^[123][0-9][0-9]$ ]]; then
+    ok "$(T 'Локальная проверка сайта успешна.' 'Local website check passed.')"
+  else
+    warn "$(T 'Локальная HTTPS-проверка не получила успешный ответ.' 'Local HTTPS check did not return a successful response.')"
+  fi
+  if [[ "$code_public" =~ ^[123][0-9][0-9]$ ]]; then
+    ok "$(T 'Публичная проверка сайта успешна.' 'Public website check passed.')"
+  else
+    warn "$(T 'Публичная проверка неуспешна. Проверьте DNS, firewall и web-сервер.' 'Public check failed. Check DNS, firewall, and the web server.')"
+  fi
+  pause_menu
+}
+
+diagnostics_menu() {
+  local c
+  while true; do
+    header "$(T 'Состояние и диагностика' 'Status and diagnostics')"
+    print_network_summary
+    printf '\n'
+    printf '  1) %s\n' "$(T 'Проверить интернет с каждого IPv4' 'Test Internet access from every IPv4')"
+    printf '  2) %s\n' "$(T 'Проверить сайт и DNS' 'Check website and DNS')"
+    printf '  3) %s\n' "$(T 'Показать полный ip addr / ip route' 'Show full ip addr / ip route')"
+    printf '  0) %s\n' "$(T 'Назад' 'Back')"
+    c="$(read_menu_choice "> ")" || return
+    case "$c" in
+      1) printf '\n'; test_all_local_ips; pause_menu ;;
+      2) site_check_screen ;;
+      3) header "$(T 'Полная сетевая информация' 'Full network information')"; ip addr; printf '\n'; ip route show table all; pause_menu ;;
+      0) return ;;
+      *) warn "$(T 'Нет такого пункта.' 'No such menu item.')"; sleep 1 ;;
+    esac
+  done
+}
+
+# ---------- Backup / restore ----------
+
+create_backup() {
+  local reason="${1:-manual}" stamp dir
+  ensure_dirs
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  dir="${BACKUP_ROOT}/${stamp}-${reason//[^A-Za-z0-9_.-]/_}"
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+
+  tar -C / -czf "$dir/netplan.tgz" etc/netplan
+  [[ -d /etc/nginx ]] && tar -C / -czf "$dir/nginx.tgz" etc/nginx || true
+  [[ -f "$CONFIG_FILE" ]] && cp -a "$CONFIG_FILE" "$dir/app.conf" || true
+  ip addr show > "$dir/ip-addr.txt"
+  ip route show table all > "$dir/ip-route.txt"
+  netplan get > "$dir/netplan-get.txt" 2>&1 || true
+
+  {
+    printf 'CREATED_AT=%q\n' "$(date -Is)"
+    printf 'REASON=%q\n' "$reason"
+    printf 'PUBLIC_IP=%q\n' "$(public_ipv4 || true)"
+    printf 'INTERFACE=%q\n' "$(current_iface || true)"
+    printf 'GATEWAY=%q\n' "$(current_gateway || true)"
+  } > "$dir/meta.env"
+  chmod 600 "$dir/meta.env"
+  printf '%s\n' "$dir" > "$STATE_DIR/latest-backup"
+  printf '%s\n' "$dir"
+}
+
+list_backups() {
+  find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r
+}
+
+restore_backup_dir() {
+  local dir="$1" safety
+  [[ -d "$dir" && -f "$dir/netplan.tgz" ]] || { err "$(T 'Резервная копия повреждена или не найдена.' 'Backup is missing or incomplete.')"; return 1; }
+
+  info "$(T 'Создаём страховочную копию текущего состояния перед восстановлением...' 'Creating a safety backup of the current state before restore...')"
+  safety="$(create_backup pre-restore)"
+  ok "$(T 'Страховочная копия:' 'Safety backup:') $safety"
+
+  rm -f "$MANAGED_NETPLAN"
+  tar -C / -xzf "$dir/netplan.tgz"
+  if [[ -f "$dir/nginx.tgz" ]]; then
+    tar -C / -xzf "$dir/nginx.tgz"
+  fi
+
+  if ! netplan generate; then
+    err "$(T 'Восстановленный Netplan не прошёл проверку. Возвращаем страховочную копию.' 'Restored Netplan failed validation. Restoring the safety copy.')"
+    rm -f "$MANAGED_NETPLAN"
+    tar -C / -xzf "$safety/netplan.tgz"
+    [[ -f "$safety/nginx.tgz" ]] && tar -C / -xzf "$safety/nginx.tgz" || true
+    netplan generate || true
+    return 1
+  fi
+  if command -v nginx >/dev/null 2>&1 && ! nginx -t; then
+    err "$(T 'Восстановленный nginx не прошёл проверку. Возвращаем страховочную копию.' 'Restored nginx failed validation. Restoring the safety copy.')"
+    rm -f "$MANAGED_NETPLAN"
+    tar -C / -xzf "$safety/netplan.tgz"
+    [[ -f "$safety/nginx.tgz" ]] && tar -C / -xzf "$safety/nginx.tgz" || true
+    netplan generate || true
+    return 1
+  fi
+
+  warn "$(T 'Сейчас Netplan применит восстановленную конфигурацию в безопасном режиме.' 'Netplan will now apply the restored configuration in safe mode.')"
+  if ! netplan try --timeout "$TRY_TIMEOUT"; then
+    warn "$(T 'Настройки не были подтверждены и Netplan вернул предыдущую конфигурацию.' 'Settings were not confirmed and Netplan reverted the previous configuration.')"
+    return 1
+  fi
+  command -v nginx >/dev/null 2>&1 && { nginx -t && systemctl reload nginx; } || true
+  ok "$(T 'Резервная копия восстановлена.' 'Backup restored.')"
+  return 0
+}
+
+backup_menu() {
+  local c selected idx name dir
+  local backups=()
+  while true; do
+    header "$(T 'Резервные копии и восстановление' 'Backups and restore')"
+    printf '  1) %s\n' "$(T 'Создать резервную копию сейчас' 'Create a backup now')"
+    printf '  2) %s\n' "$(T 'Восстановить резервную копию' 'Restore a backup')"
+    printf '  3) %s\n' "$(T 'Показать список копий' 'List backups')"
+    printf '  0) %s\n' "$(T 'Назад' 'Back')"
+    c="$(read_menu_choice "> ")" || return
+    case "$c" in
+      1)
+        dir="$(create_backup manual)"
+        ok "$(T 'Создана резервная копия:' 'Backup created:') $dir"
+        pause_menu
+        ;;
+      2)
+        mapfile -t backups < <(list_backups)
+        if (( ${#backups[@]} == 0 )); then
+          warn "$(T 'Резервных копий пока нет.' 'No backups found.')"
+          pause_menu
+          continue
+        fi
+        header "$(T 'Выберите резервную копию' 'Choose a backup')"
+        idx=1
+        for name in "${backups[@]}"; do
+          printf '  %d) %s\n' "$idx" "$name"
+          idx=$((idx + 1))
+        done
+        printf '  0) %s\n' "$(T 'Назад' 'Back')"
+        selected="$(read_menu_choice "> ")" || continue
+        [[ "$selected" == "0" ]] && continue
+        if (( selected < 1 || selected > ${#backups[@]} )); then
+          warn "$(T 'Нет такой резервной копии.' 'No such backup.')"
+          pause_menu
+          continue
+        fi
+        dir="${BACKUP_ROOT}/${backups[$((selected-1))]}"
+        printf '\n%s: %s\n' "$(T 'Будет восстановлено' 'Will restore')" "$dir"
+        warn "$(T 'Сетевое соединение может кратковременно прерваться.' 'The network connection may briefly pause.')"
+        if confirm_choice "$(T 'Продолжить восстановление?' 'Continue with restore?')"; then
+          if restore_backup_dir "$dir"; then
+            if confirm_choice "$(T 'Перезагрузить сервер сейчас? Все активные SSH-сессии будут разорваны.' 'Reboot the server now? All active SSH sessions will disconnect.')"; then
+              systemctl reboot
+              exit 0
+            fi
+          fi
+        fi
+        pause_menu
+        ;;
+      3)
+        header "$(T 'Список резервных копий' 'Backup list')"
+        list_backups || true
+        pause_menu
+        ;;
+      0) return ;;
+      *) warn "$(T 'Нет такого пункта.' 'No such menu item.')"; sleep 1 ;;
+    esac
+  done
+}
+
+# ---------- Nginx helpers ----------
+
+nginx_find_old_ip_refs() {
+  local old_ip="$1"
+  [[ -d /etc/nginx/sites-enabled ]] || return 0
+  grep -RIl --include='*' -E "(^|[^0-9])${old_ip//./\\.}([^0-9]|$)" /etc/nginx/sites-enabled 2>/dev/null || true
+}
+
+nginx_update_network_binds() {
+  local old_ip="$1" new_ip="$2" f real tmp changed=0
+  command -v nginx >/dev/null 2>&1 || return 0
+  [[ -d /etc/nginx/sites-enabled ]] || return 0
+
+  local files=()
+  mapfile -t files < <(nginx_find_old_ip_refs "$old_ip")
+  (( ${#files[@]} > 0 )) || return 0
+
+  info "$(T 'Найдены активные конфиги nginx со старым IP. Обновляем только proxy_bind и listen.' 'Active nginx configs reference the old IP. Updating only proxy_bind and listen directives.')"
+  for f in "${files[@]}"; do
+    real="$(readlink -f "$f" 2>/dev/null || printf '%s' "$f")"
+    [[ -f "$real" ]] || continue
+    tmp="$(mktemp)"
+    sed -E \
+      -e "s#^([[:space:]]*proxy_bind[[:space:]]+)${old_ip//./\\.}([[:space:]]*;)#\\1${new_ip}\\2#" \
+      -e "s#^([[:space:]]*listen[[:space:]]+)${old_ip//./\\.}:#\\1${new_ip}:#" \
+      "$real" > "$tmp"
+    if ! cmp -s "$real" "$tmp"; then
+      cat "$tmp" > "$real"
+      changed=1
+      info "nginx: $real"
+    fi
+    rm -f "$tmp"
+  done
+
+  if (( changed == 1 )); then
+    if ! nginx -t; then
+      return 1
+    fi
+    systemctl reload nginx
+    ok "$(T 'nginx проверен и перезагружен.' 'nginx validated and reloaded.')"
+  fi
+  return 0
+}
+
+# ---------- Switch wizard ----------
+
+choose_target_ip() {
+  local iface="$1" current_ip="$2" c idx cidr ipaddr input prefix
+  local cidrs=()
+  mapfile -t cidrs < <(local_ipv4_cidrs "$iface")
+
+  while true; do
+    header "$(T 'Замена основного IPv4 - выбор адреса' 'Change primary IPv4 - choose address')"
+    printf '%s\n\n' "$(T 'Ниже показаны IPv4, которые Linux уже видит на этом сервере.' 'These are IPv4 addresses currently visible to Linux on this server.')"
+    printf '%b%s%b\n' "$C_DIM" "$(T 'IP из панели провайдера, который ещё не добавлен в Linux, здесь не появится. Его можно ввести вручную.' 'An IP attached at the provider but not yet added to Linux will not appear here. You can enter it manually.')" "$C_RESET"
+    printf '\n'
+
+    idx=1
+    for cidr in "${cidrs[@]}"; do
+      ipaddr="$(cidr_ip "$cidr")"
+      if [[ "$ipaddr" == "$current_ip" ]]; then
+        printf '  %d) %-20s %b%s%b\n' "$idx" "$cidr" "$C_GREEN" "$(T '[текущий основной]' '[current primary]')" "$C_RESET"
+      else
+        printf '  %d) %s\n' "$idx" "$cidr"
+      fi
+      idx=$((idx + 1))
+    done
+    printf '  %d) %s\n' "$idx" "$(T 'Ввести новый IPv4 вручную' 'Enter a new IPv4 manually')"
+    printf '  0) %s\n' "$(T 'Назад' 'Back')"
+
+    c="$(read_menu_choice "> ")" || return 1
+    [[ "$c" == "0" ]] && return 1
+    if (( c >= 1 && c <= ${#cidrs[@]} )); then
+      cidr="${cidrs[$((c-1))]}"
+      ipaddr="$(cidr_ip "$cidr")"
+      if [[ "$ipaddr" == "$current_ip" ]]; then
+        warn "$(T 'Этот IPv4 уже является основным.' 'This IPv4 is already primary.')"
+        pause_menu
+        continue
+      fi
+      TARGET_IP="$ipaddr"
+      TARGET_PREFIX="$(cidr_prefix "$cidr")"
+      return 0
+    fi
+    if (( c == idx )); then
+      while true; do
+        read -r -p "$(T 'Новый IPv4 (0 = назад): ' 'New IPv4 (0 = back): ')" input || return 1
+        [[ "$input" == "0" ]] && break
+        if [[ "$input" == */* ]]; then
+          ipaddr="${input%%/*}"
+          prefix="${input#*/}"
+        else
+          ipaddr="$input"
+          prefix="24"
+        fi
+        if is_ipv4 "$ipaddr" && is_prefix "$prefix"; then
+          TARGET_IP="$ipaddr"
+          TARGET_PREFIX="$prefix"
+          return 0
+        fi
+        warn "$(T 'Некорректный IPv4/CIDR. Пример: 5.42.120.63 или 5.42.120.63/24' 'Invalid IPv4/CIDR. Example: 5.42.120.63 or 5.42.120.63/24')"
+      done
+      continue
+    fi
+    warn "$(T 'Нет такого пункта.' 'No such menu item.')"
+    sleep 1
+  done
+}
+
+prepare_target_ip_for_test() {
+  local iface="$1" cidr="${TARGET_IP}/${TARGET_PREFIX}"
+  if iface_has_ip "$iface" "$TARGET_IP"; then
+    return 0
+  fi
+  info "$(T "Временно добавляем $cidr только для проверки..." "Temporarily adding $cidr for testing...")"
+  if ! ip addr add "$cidr" dev "$iface"; then
+    err "$(T 'Не удалось временно добавить адрес.' 'Could not temporarily add the address.')"
+    return 1
+  fi
+  TEMP_ADDED_CIDR="$cidr"
+  TEMP_IFACE="$iface"
+  return 0
+}
+
+choose_working_gateway() {
+  local iface="$1" current_gw="$2" suggested="" manual choice
+  suggested="$(network_first_host "$TARGET_IP" "$TARGET_PREFIX" || true)"
+
+  header "$(T 'Проверка нового IPv4 и шлюза' 'Testing new IPv4 and gateway')"
+  printf '%s %s/%s\n' "$(T 'Новый адрес:' 'New address:')" "$TARGET_IP" "$TARGET_PREFIX"
+  [[ -n "$suggested" ]] && printf '%s %s\n' "$(T 'Предполагаемый шлюз подсети:' 'Suggested subnet gateway:')" "$suggested"
+  [[ -n "$current_gw" ]] && printf '%s %s\n' "$(T 'Текущий шлюз:' 'Current gateway:')" "$current_gw"
+  printf '\n%s\n' "$(T 'Скрипт проверит маршрут, не меняя постоянную конфигурацию.' 'The script will test routing without changing persistent configuration.')"
+
+  if [[ -n "$suggested" ]]; then
+    printf '\n%s %s ...\n' "$(T 'Проверяем шлюз' 'Testing gateway')" "$suggested"
+    if probe_ip_gateway "$iface" "$TARGET_IP" "$suggested"; then
+      ok "$(T 'Новый IPv4 имеет независимый выход в интернет через этот шлюз.' 'The new IPv4 has independent Internet access through this gateway.')"
+      TARGET_GW="$suggested"
+      return 0
+    fi
+    warn "$(T 'Через предполагаемый шлюз интернет не подтвердился.' 'Internet access through the suggested gateway was not confirmed.')"
+  fi
+
+  if [[ -n "$current_gw" && "$current_gw" != "$suggested" ]]; then
+    printf '\n%s %s ...\n' "$(T 'Дополнительно проверяем текущий шлюз' 'Also testing current gateway')" "$current_gw"
+    if probe_ip_gateway "$iface" "$TARGET_IP" "$current_gw"; then
+      warn "$(T 'Новый IP работает через старый шлюз, но это может оставить зависимость от старой сети.' 'The new IP works through the old gateway, but that may keep a dependency on the old network.')"
+      printf '\n  1) %s\n' "$(T 'Использовать текущий шлюз (старый IP у провайдера пока НЕ удалять)' 'Use current gateway (do NOT remove the old provider IP yet)')"
+      printf '  2) %s\n' "$(T 'Ввести другой шлюз и проверить' 'Enter another gateway and test it')"
+      printf '  0) %s\n' "$(T 'Назад' 'Back')"
+      while true; do
+        choice="$(read_menu_choice "> ")" || return 1
+        case "$choice" in
+          1) TARGET_GW="$current_gw"; DEPENDENT_GATEWAY=1; return 0 ;;
+          2) break ;;
+          0) return 1 ;;
+          *) warn "$(T 'Нет такого пункта.' 'No such menu item.')" ;;
+        esac
+      done
     fi
   fi
-  is_ipv4 "$NEW_GW" || die "Invalid gateway: $NEW_GW"
 
-  auto_detect_domain
+  while true; do
+    read -r -p "$(T 'Введите шлюз вручную (0 = назад): ' 'Enter gateway manually (0 = back): ')" manual || return 1
+    [[ "$manual" == "0" ]] && return 1
+    if ! is_ipv4 "$manual"; then
+      warn "$(T 'Некорректный IPv4 шлюза.' 'Invalid gateway IPv4.')"
+      continue
+    fi
+    printf '%s %s ...\n' "$(T 'Проверяем' 'Testing')" "$manual"
+    if probe_ip_gateway "$iface" "$TARGET_IP" "$manual"; then
+      TARGET_GW="$manual"
+      ok "$(T 'Шлюз работает с новым IPv4.' 'Gateway works with the new IPv4.')"
+      return 0
+    fi
+    warn "$(T 'Через этот шлюз новый IPv4 не вышел в интернет.' 'The new IPv4 could not reach the Internet through this gateway.')"
+  done
+}
 
-  printf '\nPlanned change\n'
-  printf '  Old public IP : %s\n' "${old_ip:-unknown}"
-  printf '  New public IP : %s/%s\n' "$NEW_IP" "$PREFIX"
-  printf '  New gateway   : %s\n' "$NEW_GW"
-  printf '  Interface     : %s\n' "$iface"
-  [[ -n "$DOMAIN" ]] && printf '  Site test     : %s\n' "$DOMAIN"
-  printf '\nThe old provider IP will NOT be detached or deleted by this script.\n'
-
-  confirm "Continue with backup and preflight checks?" || die "Cancelled by user."
-
-  mkdir -p "$STATE_DIR" "$BACKUP_ROOT"
-  backup="$(backup_all)"
-  ok "Backup created: $backup"
-
-  # Add the new address only for preflight testing; harmless if it is already configured.
-  if ! ip -4 addr show dev "$iface" | grep -qE "[[:space:]]inet ${NEW_IP//./\\.}/"; then
-    ip addr add "$NEW_IP/$PREFIX" dev "$iface"
-    log "Temporarily added $NEW_IP/$PREFIX to $iface"
-  fi
-
-  log "Checking gateway reachability: $NEW_GW"
-  if ping -c 2 -W 2 "$NEW_GW" >/dev/null 2>&1; then
-    ok "Gateway $NEW_GW is reachable."
-  else
-    warn "Gateway $NEW_GW did not answer ping. Some providers block ICMP; continuing with outbound test."
-  fi
-
-  log "Checking outbound Internet access specifically from $NEW_IP"
-  test_public="$(public_ipv4 "$NEW_IP" || true)"
-  if [[ "$test_public" != "$NEW_IP" ]]; then
-    warn "Outbound check from $NEW_IP returned '${test_public:-no response}'."
-    warn "The new IP may not be attached/routed by the provider yet."
-    confirm "Continue anyway and rely on netplan try auto-rollback?" || {
-      ip addr del "$NEW_IP/$PREFIX" dev "$iface" 2>/dev/null || true
-      die "Stopped safely. Provider-side IP assignment should be checked first."
-    }
-  else
-    ok "New IP has working outbound Internet: $test_public"
-  fi
-
-  cat > "$NETPLAN_FILE" <<EOFNET
+write_managed_netplan() {
+  local iface="$1" metric=10
+  cat > "$MANAGED_NETPLAN" <<EOFNET
+# Managed by ZAMENAIP (${APP}) v${VERSION}
+# Generated: $(date -Is)
 network:
   version: 2
   ethernets:
     ${iface}:
       dhcp4: false
       addresses:
-        - "${NEW_IP}/${PREFIX}"
+        - "${TARGET_IP}/${TARGET_PREFIX}"
       routes:
         - to: "0.0.0.0/0"
-          via: "${NEW_GW}"
-          metric: 50
+          via: "${TARGET_GW}"
+          metric: ${metric}
+          on-link: true
       nameservers:
         addresses:
           - "${DNS1}"
           - "${DNS2}"
 EOFNET
-  chmod 600 "$NETPLAN_FILE"
+  chmod 600 "$MANAGED_NETPLAN"
+}
 
-  netplan generate || {
-    rm -f "$NETPLAN_FILE"
-    rollback_from "$backup"
-    die "netplan generate failed. Previous configuration restored."
-  }
-  ok "Netplan syntax is valid."
+save_switch_state() {
+  local backup="$1" iface="$2" old_ip="$3" old_gw="$4"
+  ensure_dirs
+  {
+    printf 'TARGET_IP=%q\n' "$TARGET_IP"
+    printf 'TARGET_PREFIX=%q\n' "$TARGET_PREFIX"
+    printf 'TARGET_GW=%q\n' "$TARGET_GW"
+    printf 'IFACE=%q\n' "$iface"
+    printf 'OLD_IP=%q\n' "$old_ip"
+    printf 'OLD_GW=%q\n' "$old_gw"
+    printf 'DOMAIN=%q\n' "$DEFAULT_DOMAIN"
+    printf 'BACKUP_DIR=%q\n' "$backup"
+    printf 'DEPENDENT_GATEWAY=%q\n' "${DEPENDENT_GATEWAY:-0}"
+    printf 'CREATED_AT=%q\n' "$(date -Is)"
+  } > "$STATE_DIR/current.env"
+  chmod 600 "$STATE_DIR/current.env"
+}
 
-  update_nginx_proxy_bind "$old_ip" "$NEW_IP"
-  if command -v nginx >/dev/null 2>&1; then
-    nginx -t || {
-      rollback_from "$backup"
-      die "nginx -t failed. Previous configuration restored."
-    }
+switch_wizard() {
+  local iface old_gw old_ip public_old backup pub_after route_after rc
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    err "$(T 'Мастер замены нужно запускать из интерактивного терминала/SSH.' 'The switch wizard must be run from an interactive terminal/SSH session.')"
+    return 1
+  fi
+  TARGET_IP=""
+  TARGET_PREFIX="24"
+  TARGET_GW=""
+  DEPENDENT_GATEWAY=0
+
+  iface="$(current_iface || true)"
+  old_gw="$(current_gateway || true)"
+  public_old="$(public_ipv4 || true)"
+  old_ip="${public_old:-$(current_route_src || true)}"
+  [[ -n "$iface" ]] || { err "$(T 'Не удалось определить основной сетевой интерфейс.' 'Could not detect the primary network interface.')"; pause_menu; return; }
+  [[ -n "$old_ip" ]] || { err "$(T 'Не удалось определить текущий IPv4.' 'Could not detect the current IPv4.')"; pause_menu; return; }
+
+  if ! choose_target_ip "$iface" "$old_ip"; then
+    cleanup_temp_ip
+    return
   fi
 
-  save_state "$backup" "$iface" "$old_ip" "$old_gw"
+  if ! prepare_target_ip_for_test "$iface"; then
+    cleanup_temp_ip
+    pause_menu
+    return
+  fi
 
-  printf '\n%bIMPORTANT%b\n' "$C_YELLOW" "$C_RESET"
-  printf 'Keep this SSH window open. Netplan will now try the new configuration.\n'
-  printf 'If you lose connectivity and cannot confirm it, Netplan should revert after %s seconds.\n\n' "$TRY_TIMEOUT"
-  confirm "Run netplan try now?" || die "Stopped before applying. Backup: $backup"
+  if ! choose_working_gateway "$iface" "$old_gw"; then
+    cleanup_temp_ip
+    return
+  fi
 
-  netplan try --timeout "$TRY_TIMEOUT"
-  ok "Netplan configuration accepted."
+  header "$(T 'План замены IPv4' 'IPv4 switch plan')"
+  printf '%-25s %s\n' "$(T 'Текущий внешний IPv4:' 'Current public IPv4:')" "$old_ip"
+  printf '%-25s %s/%s\n' "$(T 'Новый IPv4:' 'New IPv4:')" "$TARGET_IP" "$TARGET_PREFIX"
+  printf '%-25s %s\n' "$(T 'Новый шлюз:' 'New gateway:')" "$TARGET_GW"
+  printf '%-25s %s\n' "$(T 'Интерфейс:' 'Interface:')" "$iface"
+  printf '%-25s %s, %s\n' "$(T 'DNS:' 'DNS:')" "$DNS1" "$DNS2"
+  [[ -n "$DEFAULT_DOMAIN" ]] && printf '%-25s %s\n' "$(T 'Домен для проверки:' 'Domain to verify:')" "$DEFAULT_DOMAIN"
+  printf '\n'
+  if (( DEPENDENT_GATEWAY == 1 )); then
+    warn "$(T 'Выбран старый шлюз. Старый IP/сетевое подключение у провайдера нельзя удалять, пока не настроен независимый шлюз нового IP.' 'The old gateway is selected. Do not remove the old provider IP/network until the new IP has an independent gateway.')"
+  else
+    ok "$(T 'Новый IP успешно проверен через выбранный шлюз.' 'The new IP was successfully tested through the selected gateway.')"
+  fi
+  printf '%s\n' "$(T 'Перед изменением будут сохранены Netplan, nginx, адреса и маршруты.' 'Netplan, nginx, addresses, and routes will be backed up before changes.')"
+  printf '%s\n' "$(T 'Скрипт НЕ удаляет IP из панели хостинг-провайдера.' 'The script NEVER deletes an IP from the hosting provider panel.')"
 
-  local public_new route_check
-  public_new="$(public_ipv4 || true)"
-  route_check="$(ip -4 route get 1.1.1.1 2>/dev/null || true)"
+  if confirm_choice "$(T 'Начать безопасную замену?' 'Start the safe switch?')"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  (( rc == 0 )) || { cleanup_temp_ip; return; }
 
-  printf '\nVerification\n'
-  printf '  Public IPv4 : %s\n' "${public_new:-unknown}"
-  printf '  Route       : %s\n' "$route_check"
+  backup="$(create_backup before-switch)"
+  ok "$(T 'Резервная копия создана:' 'Backup created:') $backup"
 
-  if [[ "$public_new" != "$NEW_IP" ]] || ! grep -q "src $NEW_IP" <<<"$route_check"; then
-    warn "Verification failed: expected public/source IP $NEW_IP."
-    if confirm "Rollback now?"; then
-      rollback_from "$backup"
-      exit 1
+  write_managed_netplan "$iface"
+  if ! netplan generate; then
+    err "$(T 'Netplan не прошёл проверку. Изменения отменены.' 'Netplan validation failed. Changes were cancelled.')"
+    rm -f "$MANAGED_NETPLAN"
+    tar -C / -xzf "$backup/netplan.tgz"
+    cleanup_temp_ip
+    pause_menu
+    return
+  fi
+  ok "$(T 'Новая конфигурация Netplan синтаксически корректна.' 'New Netplan configuration is syntactically valid.')"
+
+  # Remove temporary address before Netplan takes ownership of it.
+  cleanup_temp_ip
+
+  warn "$(T "Сейчас будет запущен netplan try на ${TRY_TIMEOUT} секунд. НЕ закрывайте SSH. Если связь пропадёт и вы не подтвердите настройки, Netplan постарается вернуть прежнюю сеть." "netplan try will run for ${TRY_TIMEOUT} seconds. KEEP THIS SSH SESSION OPEN. If connectivity is lost and settings are not confirmed, Netplan will try to revert the previous network.")"
+  if confirm_choice "$(T 'Запустить netplan try?' 'Run netplan try?')"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if (( rc != 0 )); then
+    warn "$(T 'Применение отменено. Резервная копия сохранена.' 'Apply cancelled. The backup has been kept.')"
+    pause_menu
+    return
+  fi
+
+  if ! netplan try --timeout "$TRY_TIMEOUT"; then
+    warn "$(T 'Netplan не был подтверждён или вернул старую конфигурацию.' 'Netplan was not confirmed or reverted the old configuration.')"
+    pause_menu
+    return
+  fi
+
+  pub_after="$(public_ipv4 || true)"
+  route_after="$(ip -4 route get 1.1.1.1 2>/dev/null || true)"
+  printf '\n%s\n' "$(T 'Проверка после применения:' 'Post-apply verification:')"
+  printf '  %-20s %s\n' "$(T 'Внешний IPv4:' 'Public IPv4:')" "${pub_after:-unknown}"
+  printf '  %-20s %s\n' "$(T 'Маршрут:' 'Route:')" "$route_after"
+
+  if [[ "$pub_after" != "$TARGET_IP" ]] || ! grep -q "src $TARGET_IP" <<<"$route_after"; then
+    err "$(T 'Новый IP не стал основным. Не удаляйте старый IP у провайдера.' 'The new IP did not become primary. Do not remove the old provider IP.')"
+    if confirm_choice "$(T 'Восстановить резервную копию прямо сейчас?' 'Restore the backup now?')"; then
+      restore_backup_dir "$backup" || true
     fi
-    die "Network state is not verified. Do NOT release the old provider IP. Backup: $backup"
+    pause_menu
+    return
+  fi
+  ok "$(T 'Новый IPv4 стал основным для исходящих соединений.' 'The new IPv4 is now primary for outbound connections.')"
+
+  if ! nginx_update_network_binds "$old_ip" "$TARGET_IP"; then
+    err "$(T 'После обновления сетевых директив nginx проверка nginx -t не прошла.' 'nginx -t failed after updating network bind directives.')"
+    if confirm_choice "$(T 'Восстановить резервную копию?' 'Restore the backup?')"; then
+      restore_backup_dir "$backup" || true
+    fi
+    pause_menu
+    return
   fi
 
-  ok "Public/source IPv4 is now $NEW_IP."
-  verify_domain
+  save_switch_state "$backup" "$iface" "$old_ip" "$old_gw"
 
-  printf '\n%bSUCCESS%b\n' "$C_GREEN" "$C_RESET"
-  printf 'New primary IPv4: %s\n' "$NEW_IP"
-  printf 'Gateway:          %s\n' "$NEW_GW"
-  printf 'Backup:           %s\n' "$backup"
-  printf '\nNext safe step:\n'
-  printf '  1. Reboot the VPS.\n'
-  printf '  2. Run: sudo %s verify\n' "$0"
-  printf '  3. Only after verify passes, detach the old IP in the provider panel.\n'
-  printf '  4. Verify again before permanently deleting/releasing the old IP.\n'
-}
-
-rollback_cmd() {
-  require_root rollback
-  need_cmd netplan
-  need_cmd tar
-  local backup="${1:-}"
-  if [[ -z "$backup" && -f "${STATE_DIR}/latest-backup" ]]; then
-    backup="$(cat "${STATE_DIR}/latest-backup")"
+  if [[ -n "$DEFAULT_DOMAIN" ]]; then
+    printf '\n'
+    info "$(T "Проверяем сайт ${DEFAULT_DOMAIN}..." "Checking website ${DEFAULT_DOMAIN}...")"
+    local code_local code_public dns_ips
+    code_local="$(http_code "https://${DEFAULT_DOMAIN}/" "${DEFAULT_DOMAIN}:443:127.0.0.1")"
+    code_public="$(http_code "https://${DEFAULT_DOMAIN}/")"
+    dns_ips="$(resolve_ipv4s "$DEFAULT_DOMAIN" || true)"
+    printf '  %-20s %s\n' "$(T 'Локальный HTTPS:' 'Local HTTPS:')" "${code_local:-no-response}"
+    printf '  %-20s %s\n' "$(T 'Публичный HTTPS:' 'Public HTTPS:')" "${code_public:-no-response}"
+    printf '  %-20s %s\n' "$(T 'DNS A:' 'DNS A:')" "${dns_ips//$'\n'/, }"
+    if ! grep -Fxq "$TARGET_IP" <<<"$dns_ips"; then
+      warn "$(T "DNS ещё не указывает на $TARGET_IP. Измените A-запись у вашего DNS-провайдера, если сайт должен открываться по новому IP." "DNS does not yet point to $TARGET_IP. Update the A record at your DNS provider if the website should use the new IP.")"
+    fi
   fi
-  [[ -n "$backup" ]] || die "No backup specified and no latest backup is recorded."
-  rollback_from "$backup"
+
+  printf '\n%b%s%b\n' "$C_GREEN$C_BOLD" "$(T 'ЗАМЕНА УСПЕШНА' 'SWITCH COMPLETED')" "$C_RESET"
+  printf '%s %s\n' "$(T 'Новый основной IPv4:' 'New primary IPv4:')" "$TARGET_IP"
+  printf '%s %s\n' "$(T 'Резервная копия:' 'Backup:')" "$backup"
+  printf '\n%s\n' "$(T 'Рекомендуется перезагрузка и повторная проверка. Старый IP у провайдера удаляйте только после успешной проверки после reboot.' 'A reboot and another verification are recommended. Remove the old provider IP only after a successful post-reboot verification.')"
+
+  if confirm_choice "$(T 'Перезагрузить сервер сейчас? SSH-сессия будет разорвана.' 'Reboot the server now? The SSH session will disconnect.')"; then
+    systemctl reboot
+    exit 0
+  fi
+  pause_menu
 }
 
-# Quick mode: `zamenaip` starts switch directly. Options can also be passed
-# without writing the `switch` subcommand, e.g. `zamenaip --domain example.com`.
-if [[ $# -eq 0 ]]; then
-  COMMAND="switch"
-elif [[ "$1" == -* ]]; then
-  COMMAND="switch"
-else
-  COMMAND="$1"
-  shift
-fi
+# ---------- Verify ----------
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --new-ip) NEW_IP="${2:-}"; shift 2 ;;
-    --gateway) NEW_GW="${2:-}"; shift 2 ;;
-    --prefix) PREFIX="${2:-}"; shift 2 ;;
-    --domain) DOMAIN="${2:-}"; shift 2 ;;
-    --dns1) DNS1="${2:-}"; shift 2 ;;
-    --dns2) DNS2="${2:-}"; shift 2 ;;
-    --skip-nginx) SKIP_NGINX=1; shift ;;
-    -y|--yes) ASSUME_YES=1; shift ;;
-    -h|--help) usage; exit 0 ;;
-    *)
-      if [[ "$COMMAND" == "rollback" && -z "${ROLLBACK_ARG:-}" ]]; then
-        ROLLBACK_ARG="$1"; shift
-      else
-        die "Unknown option: $1"
-      fi
-      ;;
+verify_saved_state() {
+  local target iface pub route domain dependent
+  if [[ ! -f "$STATE_DIR/current.env" ]]; then
+    warn "$(T 'Нет сохранённой информации о последней замене.' 'No saved information about the last switch.')"
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  source "$STATE_DIR/current.env"
+  target="${TARGET_IP:-}"
+  iface="${IFACE:-$(current_iface || true)}"
+  domain="${DOMAIN:-$DEFAULT_DOMAIN}"
+  dependent="${DEPENDENT_GATEWAY:-0}"
+  pub="$(public_ipv4 || true)"
+  route="$(ip -4 route get 1.1.1.1 2>/dev/null || true)"
+
+  printf '%-24s %s\n' "$(T 'Ожидаемый IPv4:' 'Expected IPv4:')" "$target"
+  printf '%-24s %s\n' "$(T 'Текущий внешний IPv4:' 'Current public IPv4:')" "${pub:-unknown}"
+  printf '%-24s %s\n' "$(T 'Интерфейс:' 'Interface:')" "$iface"
+  printf '%-24s %s\n' "$(T 'Маршрут:' 'Route:')" "$route"
+
+  if [[ "$pub" != "$target" ]] || ! grep -q "src $target" <<<"$route"; then
+    err "$(T 'Проверка не пройдена. Старый IP у провайдера НЕ удаляйте.' 'Verification failed. Do NOT remove the old provider IP.')"
+    return 1
+  fi
+  command -v nginx >/dev/null 2>&1 && nginx -t || true
+  ok "$(T 'Основной исходящий IPv4 подтверждён.' 'Primary outbound IPv4 verified.')"
+
+  if [[ -n "$domain" ]]; then
+    local code dns_ips
+    code="$(http_code "https://${domain}/")"
+    dns_ips="$(resolve_ipv4s "$domain" || true)"
+    printf '%-24s %s\n' "$(T 'Сайт HTTPS:' 'Website HTTPS:')" "${code:-no-response}"
+    printf '%-24s %s\n' "$(T 'DNS A:' 'DNS A:')" "${dns_ips//$'\n'/, }"
+  fi
+
+  if [[ "$dependent" == "1" ]]; then
+    warn "$(T 'Последняя замена использует старый шлюз. Не удаляйте старое подключение у провайдера без отдельной проверки.' 'The last switch uses the old gateway. Do not remove the old provider network without a separate check.')"
+  else
+    ok "$(T 'После reboot сеть работает на новом IPv4. Теперь можно сначала ОТВЯЗАТЬ старый IP у провайдера, проверить ещё раз и только затем удалять его окончательно.' 'After reboot the network works on the new IPv4. You may now DETACH the old provider IP first, verify again, and only then delete/release it permanently.')"
+  fi
+  return 0
+}
+
+verify_screen() {
+  header "$(T 'Проверка после замены / reboot' 'Post-switch / post-reboot verification')"
+  verify_saved_state || true
+  pause_menu
+}
+
+# ---------- Settings / help ----------
+
+settings_menu() {
+  local c input
+  while true; do
+    header "$(T 'Настройки' 'Settings')"
+    printf '%-22s %s\n' "$(T 'Язык:' 'Language:')" "$([[ "$LANGUAGE" == ru ]] && echo 'Русский' || echo 'English')"
+    printf '%-22s %s\n' "$(T 'Домен:' 'Domain:')" "${DEFAULT_DOMAIN:-$(T 'не задан' 'not set')}"
+    printf '%-22s %s, %s\n\n' 'DNS:' "$DNS1" "$DNS2"
+    printf '  1) %s\n' "$(T 'Изменить язык' 'Change language')"
+    printf '  2) %s\n' "$(T 'Задать домен для проверки сайта' 'Set website domain for checks')"
+    printf '  3) %s\n' "$(T 'Изменить DNS-серверы' 'Change DNS servers')"
+    printf '  0) %s\n' "$(T 'Назад' 'Back')"
+    c="$(read_menu_choice "> ")" || return
+    case "$c" in
+      1) choose_language ;;
+      2)
+        read -r -p "$(T 'Домен без https:// (пусто = очистить, 0 = назад): ' 'Domain without https:// (blank = clear, 0 = back): ')" input || continue
+        [[ "$input" == "0" ]] && continue
+        input="${input#http://}"; input="${input#https://}"; input="${input%%/*}"
+        DEFAULT_DOMAIN="$input"
+        save_config
+        ok "$(T 'Настройка домена сохранена.' 'Domain setting saved.')"
+        pause_menu
+        ;;
+      3)
+        read -r -p "DNS 1 [$DNS1] (0 = $(T 'назад' 'back')): " input || continue
+        [[ "$input" == "0" ]] && continue
+        [[ -n "$input" ]] && DNS1="$input"
+        read -r -p "DNS 2 [$DNS2] (0 = $(T 'назад' 'back')): " input || continue
+        [[ "$input" == "0" ]] && continue
+        [[ -n "$input" ]] && DNS2="$input"
+        if ! is_ipv4 "$DNS1" || ! is_ipv4 "$DNS2"; then
+          warn "$(T 'DNS должен быть IPv4-адресом.' 'DNS must be an IPv4 address.')"
+        else
+          save_config
+          ok "$(T 'DNS сохранён.' 'DNS settings saved.')"
+        fi
+        pause_menu
+        ;;
+      0) return ;;
+      *) warn "$(T 'Нет такого пункта.' 'No such menu item.')"; sleep 1 ;;
+    esac
+  done
+}
+
+help_screen() {
+  header "$(T 'Справка оператору' 'Operator guide')"
+  if [[ "$LANGUAGE" == "ru" ]]; then
+    cat <<'HELP_RU'
+Как безопасно заменить IPv4:
+
+  1. В панели хостинг-провайдера сначала привяжите новый IPv4 к VPS.
+  2. Запустите: sudo zamenaip
+  3. Пункт 1 — проверьте текущее состояние и доступ IP.
+  4. Пункт 2 — выберите новый IP из списка или введите вручную.
+  5. Скрипт временно проверит IP и шлюз до изменения Netplan.
+  6. Перед изменениями автоматически создаётся резервная копия.
+  7. Netplan применяется через `netplan try` с автооткатом по таймауту.
+  8. После успешной замены проверьте сайт/DNS.
+  9. Перезагрузите сервер и выполните пункт 3 "Проверка после reboot".
+ 10. Только после успешной проверки отвяжите старый IP у провайдера.
+ 11. Проверьте ещё раз. Затем старый IP можно удалить окончательно.
+
+Важно:
+  - Скрипт не может универсально увидеть IP, который существует только в панели
+    провайдера и ещё не добавлен в Linux. Такой адрес вводится вручную.
+  - Скрипт никогда сам не удаляет IP у хостинг-провайдера.
+  - Автоматическая смена DNS у регистратора не выполняется без API конкретного
+    DNS-провайдера. Скрипт проверит DNS и подскажет нужный A-адрес.
+  - 0 в меню всегда означает "Назад".
+HELP_RU
+  else
+    cat <<'HELP_EN'
+How to change IPv4 safely:
+
+  1. Attach the new IPv4 to the VPS in your hosting provider panel first.
+  2. Run: sudo zamenaip
+  3. Option 1 checks the current network and IP connectivity.
+  4. Option 2 lets you choose a detected IP or enter one manually.
+  5. The script tests the IP and gateway before changing Netplan.
+  6. A backup is created automatically before changes.
+  7. Netplan is applied with `netplan try` and timeout rollback protection.
+  8. After the switch, check the website and DNS.
+  9. Reboot, then use option 3 "Post-reboot verification".
+ 10. Only after successful verification should you detach the old provider IP.
+ 11. Verify once more, then permanently release/delete the old IP if desired.
+
+Important:
+  - The script cannot generically discover an IP that exists only in a provider
+    control panel and is not yet configured in Linux. Enter such an IP manually.
+  - The script never deletes an IP at the hosting provider.
+  - DNS cannot be changed generically without a specific DNS provider API.
+    The script checks DNS and tells the operator which A record is needed.
+  - 0 always means "Back" in menus.
+HELP_EN
+  fi
+  pause_menu
+}
+
+# ---------- Main menu ----------
+
+main_menu() {
+  local c
+  while true; do
+    header "$(T 'Главное меню' 'Main menu')"
+    local pub iface
+    pub="$(public_ipv4_once || true)"
+    [[ -n "$pub" ]] || pub="$(current_route_src || true)"
+    iface="$(current_iface || true)"
+    printf '%s %b%s%b    %s %s\n\n' "$(T 'Текущий внешний IPv4:' 'Current public IPv4:')" "$C_GREEN" "${pub:-unknown}" "$C_RESET" "$(T 'Интерфейс:' 'Interface:')" "${iface:-unknown}"
+    printf '  1) %s\n' "$(T 'Состояние IP и диагностика' 'IP status and diagnostics')"
+    printf '  2) %s\n' "$(T 'Заменить основной IPv4' 'Change primary IPv4')"
+    printf '  3) %s\n' "$(T 'Проверка после замены / reboot' 'Verify after switch / reboot')"
+    printf '  4) %s\n' "$(T 'Резервные копии и восстановление' 'Backups and restore')"
+    printf '  5) %s\n' "$(T 'Проверить сайт и DNS' 'Check website and DNS')"
+    printf '  6) %s\n' "$(T 'Настройки / язык' 'Settings / language')"
+    printf '  7) %s\n' "$(T 'Справка оператору' 'Operator guide')"
+    printf '  0) %s\n' "$(T 'Выход' 'Exit')"
+    printf '\n%b%s%b\n' "$C_DIM" "$(T 'Подсказка: в любом вложенном меню 0 = назад.' 'Tip: 0 means Back in every submenu.')" "$C_RESET"
+
+    c="$(read_menu_choice "> ")" || exit 0
+    case "$c" in
+      1) diagnostics_menu ;;
+      2) switch_wizard ;;
+      3) verify_screen ;;
+      4) backup_menu ;;
+      5) site_check_screen ;;
+      6) settings_menu ;;
+      7) help_screen ;;
+      0) clear_screen; exit 0 ;;
+      *) warn "$(T 'Нет такого пункта.' 'No such menu item.')"; sleep 1 ;;
+    esac
+  done
+}
+
+# ---------- CLI ----------
+
+usage() {
+  cat <<EOF_USAGE
+ZAMENAIP / Safe VPS IP Switch v${VERSION}
+
+Usage:
+  sudo zamenaip                 Interactive menu / Интерактивное меню
+  zamenaip status               Quick status
+  sudo zamenaip switch          Open guided switch wizard
+  sudo zamenaip verify          Verify last switch
+  sudo zamenaip backup          Create backup
+  sudo zamenaip rollback        Open backup/restore menu
+  sudo zamenaip language        Change language
+  zamenaip --version
+EOF_USAGE
+}
+
+status_cli() {
+  header "$(T 'Состояние сети' 'Network status')"
+  print_network_summary
+}
+
+main() {
+  local cmd="${1:-menu}"
+  case "$cmd" in
+    --version|version) printf '%s %s\n' "$APP" "$VERSION"; return 0 ;;
+    -h|--help|help) usage; return 0 ;;
   esac
-done
 
-case "$COMMAND" in
-  switch) switch_cmd ;;
-  verify) verify_cmd ;;
-  rollback) rollback_cmd "${ROLLBACK_ARG:-}" ;;
-  status) status_cmd ;;
-  help|-h|--help) usage ;;
-  *) usage; die "Unknown command: $COMMAND" ;;
-esac
+  load_config
+  ensure_root_for_menu
+  ensure_dirs
+  ensure_language
+  check_base_dependencies || exit 1
+
+  case "$cmd" in
+    menu) main_menu ;;
+    status) status_cli ;;
+    switch) switch_wizard ;;
+    verify) header "$(T 'Проверка' 'Verification')"; verify_saved_state || exit 1 ;;
+    backup) printf '%s\n' "$(create_backup manual-cli)" ;;
+    rollback) backup_menu ;;
+    language) choose_language ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"
